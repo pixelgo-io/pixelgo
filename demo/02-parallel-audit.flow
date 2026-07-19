@@ -1,0 +1,34 @@
+# DEMO 2: Parallel analysis (fan-out + fan-in)
+#
+# coordinator splits the work -> 3 agents analyze SIMULTANEOUSLY, each on its
+# own specialty -> merger combines the 3 reports into a single one.
+#
+# What you see in the web interface:
+#   - 3 pixels leave coordinator AT ONCE (fan-out) -> parallelism
+#   - the 3 agents pulse at the same time
+#   - the pixels CONVERGE toward merger (fan-in) -> merger waits for all
+#
+# The analysis takes as long as the slowest agent, not the sum of them.
+#
+# Run:
+#   ./pixelgo flow run demo demo/02-parallel-audit.flow "Analyze src/calc.c"
+
+entry coordinator
+
+node coordinator
+node security
+node performance
+node style
+node merger
+
+# FAN-OUT: 3 edges from the same node -> the 3 run IN PARALLEL
+edge coordinator -> security
+edge coordinator -> performance
+edge coordinator -> style
+
+# FAN-IN: 3 edges into merger -> waits for ALL, receives all reports
+edge security    -> merger
+edge performance -> merger
+edge style       -> merger
+
+edge merger -> END

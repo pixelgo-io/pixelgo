@@ -1,0 +1,27 @@
+# EXAMPLE 3: Agents on DIFFERENT providers in the same graph
+#
+# Each agent has EXACTLY one model, but the graph mixes providers freely:
+#   researcher -> gemini  (fast and cheap for search/summarization)
+#   architect  -> claude  (complex reasoning)
+#   coder      -> gpt-4o  (code generation)
+#   reviewer   -> claude  (careful checking)
+#
+# Agents are added with the explicit provider:
+#   pixelgo agent add ai <ws> researcher gemini    gemini-2.0-flash "You are a researcher." "read_file,list_dir"
+#   pixelgo agent add ai <ws> architect  anthropic claude-sonnet-5  "You are an architect." "read_file"
+#   pixelgo agent add ai <ws> coder      openai    gpt-4o           "You are a programmer."  "read_file,write_file"
+#   pixelgo agent add ai <ws> reviewer   anthropic claude-sonnet-5  "You are a reviewer."    "read_file"
+
+entry researcher
+
+node researcher
+node architect
+node coder
+node reviewer
+
+edge researcher -> architect
+edge architect  -> coder
+edge coder      -> reviewer
+
+edge reviewer -> coder when NEEDS_FIX
+edge reviewer -> END   when APPROVED

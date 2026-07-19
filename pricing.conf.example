@@ -1,0 +1,25 @@
+# Prices per 1 MILLION tokens, in USD.
+#
+# CAREFUL: model prices CHANGE. Check them on the official pages:
+#   Anthropic: https://www.anthropic.com/pricing
+#   OpenAI:    https://openai.com/api/pricing
+#   Google:    https://ai.google.dev/pricing
+#
+# Copy to pricing.conf and adjust. Without this file, the built-in values from
+# the code are used (which may be out of date).
+#
+# Format:  provider  model_prefix  input_per_1M  output_per_1M
+#
+# Matching is done on PREFIX, so "claude-sonnet" also catches
+# "claude-sonnet-4-5-20250929". The LONGEST prefix wins.
+
+anthropic  claude-opus      15.00   75.00
+anthropic  claude-sonnet     3.00   15.00
+anthropic  claude-haiku      1.00    5.00
+
+openai     gpt-4o-mini       0.15    0.60
+openai     gpt-4o            2.50   10.00
+
+gemini     gemini-2.0-flash  0.10    0.40
+gemini     gemini-1.5-flash  0.075   0.30
+gemini     gemini-1.5-pro    1.25    5.00

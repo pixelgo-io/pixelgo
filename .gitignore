@@ -1,0 +1,15 @@
+# API keys - do NOT commit these!
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+*.o
+pixelgo
+src/web/web_assets.c
+
+# Runtime data
+workspaces/
+jobs/
+pixelgo.pid
+pixelgo.log

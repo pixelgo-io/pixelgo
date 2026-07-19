@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.pixelgo.serve</string>
+
+    <!-- Foreground mode: launchd supervises the process, so pixelgo must not
+         fork into the background. Do NOT add the daemon flag here; if it
+         forked, launchd would see the parent exit and keep restarting it. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/pixelgo</string>
+        <string>serve</string>
+        <string>8080</string>
+    </array>
+
+    <!-- pixelgo resolves workspaces/, jobs/, pixelgo.pid and pixelgo.log
+         relative to the working directory, so this must be set. -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/share/pixelgo</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it exits unexpectedly. Note: with KeepAlive as a plain
+         <true/>, launchd would also restart it after a clean `serve stop`,
+         which is rarely what you want. SuccessfulExit=false means "restart
+         only when it exited with an error". -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- launchd agents do not inherit your shell environment, so PATH must be
+         explicit: run_command needs to find gcc/make. On Apple Silicon,
+         Homebrew lives in /opt/homebrew/bin. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/share/pixelgo/pixelgo.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/share/pixelgo/pixelgo.log</string>
+
+    <!-- Do not hammer the CPU if it crash-loops. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

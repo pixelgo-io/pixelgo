@@ -1,0 +1,20 @@
+# DEMO 3: Write code and verify it yourself
+#
+# builder writes the code, compiles it, reads gcc's errors, fixes them,
+# recompiles - until it works. Then it RUNS it to verify the output.
+# tester writes separate tests and runs them.
+#
+# What you see: the agent does not write code "blind". It sees the real
+# compiler errors and fixes them. That is the difference between a text
+# generator and a programmer.
+#
+# Run:
+#   ./pixelgo flow run demo demo/03-build-verify.flow "Write a program that prints the first 20 Fibonacci numbers"
+
+entry builder
+
+node builder
+node tester
+
+edge builder -> tester
+edge tester  -> END

@@ -1,0 +1,20 @@
+# EXAMPLE 1: Pipeline with a correction loop
+#
+# planner designs -> coder implements -> reviewer checks.
+# If the reviewer writes NEEDS_FIX in its response, the work goes back to coder.
+# If it writes APPROVED, the graph ends.
+#
+# Run:  pixelgo flow run <ws> examples/01-pipeline-review.flow "Write a CSV parser"
+
+entry planner
+
+node planner
+node coder
+node reviewer
+
+edge planner  -> coder
+edge coder    -> reviewer
+
+# conditional edges: the decision is based on the reviewer's output
+edge reviewer -> coder  when NEEDS_FIX
+edge reviewer -> END    when APPROVED

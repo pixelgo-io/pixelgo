@@ -1,0 +1,41 @@
+[Unit]
+Description=pixelgo - AI agent orchestration engine
+Documentation=https://github.com/yourname/pixelgo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Foreground mode (no --daemon): systemd does the supervising, so pixelgo must
+# not fork away. With --daemon the parent exits immediately and systemd would
+# think the service died.
+Type=exec
+ExecStart=%h/.local/bin/pixelgo serve 8080
+
+# pixelgo resolves workspaces/, jobs/, pixelgo.pid and pixelgo.log relative to
+# the working directory, so this must be set explicitly.
+WorkingDirectory=%h/.local/share/pixelgo
+
+# API keys. pixelgo reads ~/.config/pixelgo/env on its own, but naming it here
+# means systemd fails loudly if the file is missing, instead of the agents
+# failing later with a confusing auth error.
+EnvironmentFile=%h/.config/pixelgo/env
+
+Restart=on-failure
+RestartSec=5s
+
+# The web UI has no authentication and binds to 127.0.0.1 only. These limits
+# reduce the blast radius if an agent runs something unexpected.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/pixelgo
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

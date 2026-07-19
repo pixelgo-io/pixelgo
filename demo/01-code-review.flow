@@ -1,0 +1,30 @@
+# DEMO 1: Code review with a correction loop
+#
+# reviewer reads the code -> finds bugs -> coder fixes them AND COMPILES
+# -> reviewer checks again -> APPROVED -> done.
+#
+# ABOUT CONDITIONAL EDGES:
+# reviewer must write NEEDS_FIX or APPROVED. If it forgets (happens with long
+# responses), no conditional edge matches.
+#
+# The fallback goes to END, not to coder. Why: if we sent it to coder, and the
+# reviewer forgot the marker every time, we would loop forever burning money.
+# Better to stop and let the user see in the log what happened.
+#
+# Run:
+#   ./pixelgo flow run demo demo/01-code-review.flow "Check src/calc.c"
+
+entry reviewer
+
+node reviewer
+node coder
+
+# normal decision (conditionals take priority over the fallback)
+edge reviewer -> coder    when NEEDS_FIX
+edge reviewer -> END      when APPROVED
+
+# fallback: if the model gave no verdict, we stop (no looping)
+edge reviewer -> END
+
+# after a fix, reviewer checks again
+edge coder -> reviewer

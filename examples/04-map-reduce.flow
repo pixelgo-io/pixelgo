@@ -1,0 +1,36 @@
+# EXAMPLE 4: Map-Reduce with 5 workers + final validation
+#
+# splitter splits the data -> 5 workers process IN PARALLEL -> reducer aggregates
+# -> validator checks. If validation fails, aggregation is retried.
+#
+# Shows that fan-out scales: add as many workers as you want, all run at once.
+
+entry splitter
+
+node splitter
+node worker_1
+node worker_2
+node worker_3
+node worker_4
+node worker_5
+node reducer
+node validator
+
+# MAP: 5 workers in parallel
+edge splitter -> worker_1
+edge splitter -> worker_2
+edge splitter -> worker_3
+edge splitter -> worker_4
+edge splitter -> worker_5
+
+# REDUCE: reducer waits for all 5
+edge worker_1 -> reducer
+edge worker_2 -> reducer
+edge worker_3 -> reducer
+edge worker_4 -> reducer
+edge worker_5 -> reducer
+
+edge reducer -> validator
+
+edge validator -> reducer when RETRY
+edge validator -> END     when OK

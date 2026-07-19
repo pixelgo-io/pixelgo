@@ -1,0 +1,27 @@
+# EXAMPLE 2: Coordinator + parallel workers (fan-out / fan-in)
+#
+# coordinator splits the work -> 3 workers run IN PARALLEL -> merger combines.
+# The 3 workers start simultaneously (fan-out). merger waits for ALL of them
+# (fan-in) and receives everyone's outputs, labeled.
+#
+# Run:  pixelgo flow run <ws> examples/02-fanout-workers.flow "Analyze the repo"
+
+entry coordinator
+
+node coordinator
+node worker_a
+node worker_b
+node worker_c
+node merger
+
+# FAN-OUT: 3 edges from the same node -> the 3 targets run in parallel
+edge coordinator -> worker_a
+edge coordinator -> worker_b
+edge coordinator -> worker_c
+
+# FAN-IN: 3 edges into the same node -> merger runs only when all 3 are done
+edge worker_a -> merger
+edge worker_b -> merger
+edge worker_c -> merger
+
+edge merger -> END

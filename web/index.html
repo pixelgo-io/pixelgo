@@ -1,0 +1,1285 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pixelgo</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e4e7eb;
+    --muted: #8b93a1;
+    --accent: #6ea8fe;
+    --accent2: #3ddc97;
+    --danger: #ff6b6b;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 18px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: .5px; }
+  header h1 span { color: var(--accent); }
+  .tabs { display: flex; gap: 4px; margin-left: auto; }
+  .tab {
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; color: var(--muted);
+    border: 1px solid transparent; font-size: 13px;
+  }
+  .tab:hover { color: var(--text); background: var(--panel2); }
+  .tab.active { color: var(--text); background: var(--panel2); border-color: var(--border); }
+
+  main { flex: 1; overflow: hidden; display: flex; }
+  .view { display: none; flex: 1; overflow: hidden; }
+  .view.active { display: flex; }
+
+  /* sidebar */
+  .side {
+    width: 260px; border-right: 1px solid var(--border); background: var(--panel);
+    padding: 14px; overflow-y: auto; flex-shrink: 0;
+  }
+  .side h3 {
+    margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .8px; color: var(--muted); font-weight: 600;
+  }
+  .side h3:not(:first-child) { margin-top: 20px; }
+
+  .item {
+    padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 3px;
+    border: 1px solid transparent; font-size: 13px;
+  }
+  .item:hover { background: var(--panel2); }
+  .item.active { background: var(--panel2); border-color: var(--accent); }
+  .item .meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  /* chat */
+  .chat-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .messages { flex: 1; overflow-y: auto; padding: 20px; }
+  .msg { margin-bottom: 18px; max-width: 780px; }
+  .msg .who {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--muted); margin-bottom: 5px; font-weight: 600;
+  }
+  .msg.user .who { color: var(--accent); }
+  .msg.assistant .who { color: var(--accent2); }
+  .msg .text {
+    background: var(--panel); padding: 12px 14px; border-radius: 8px;
+    border: 1px solid var(--border); white-space: pre-wrap; word-wrap: break-word;
+  }
+  .msg.tool .text {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    background: var(--panel2);
+  }
+
+  .composer {
+    border-top: 1px solid var(--border); padding: 12px; display: flex; gap: 8px;
+    background: var(--panel);
+  }
+  textarea, input, select {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 9px 11px; font: inherit; outline: none; width: 100%;
+  }
+  textarea:focus, input:focus, select:focus { border-color: var(--accent); }
+  textarea { resize: none; min-height: 42px; max-height: 150px; }
+
+  button {
+    background: var(--accent); color: #0b1220; border: 0; border-radius: 6px;
+    padding: 9px 18px; font: inherit; font-weight: 600; cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    font-weight: 400;
+  }
+  button.ghost:hover { color: var(--text); border-color: var(--accent); }
+
+  /* forms / panels */
+  .pane { flex: 1; overflow-y: auto; padding: 22px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 18px; margin-bottom: 16px; max-width: 720px;
+  }
+  .card h2 { margin: 0 0 14px; font-size: 15px; }
+  .row { margin-bottom: 12px; }
+  .row label {
+    display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px;
+  }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .checks { display: flex; flex-wrap: wrap; gap: 12px; }
+  .checks label {
+    display: flex; align-items: center; gap: 6px; font-size: 13px;
+    color: var(--text); cursor: pointer;
+  }
+  .checks input { width: auto; }
+
+  .hint { font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .empty { color: var(--muted); text-align: center; padding: 50px 20px; }
+
+  pre {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px; overflow-x: auto; font-family: var(--mono); font-size: 12px;
+    margin: 0; white-space: pre-wrap;
+  }
+  .toast {
+    position: fixed; bottom: 18px; right: 18px; padding: 11px 16px;
+    border-radius: 6px; background: var(--panel2); border: 1px solid var(--border);
+    font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .toast.err { border-color: var(--danger); color: var(--danger); }
+  .toast.ok { border-color: var(--accent2); color: var(--accent2); }
+
+  .badge {
+    display: inline-block; font-size: 10px; padding: 2px 7px; border-radius: 4px;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--muted);
+    font-family: var(--mono);
+  }
+  .cost-summary {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 10px; margin-bottom: 16px;
+  }
+  .cost-box {
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px;
+  }
+  .cost-box .label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--muted); margin-bottom: 4px;
+  }
+  .cost-box .value { font-size: 19px; font-weight: 600; font-family: var(--mono); }
+  .cost-box.saved { border-color: var(--accent2); }
+  .cost-box.saved .value { color: var(--accent2); }
+  .node-cost {
+    display: flex; gap: 10px; align-items: center; font-size: 11px;
+    color: var(--muted); font-family: var(--mono); margin-bottom: 4px;
+  }
+
+  /* --- the animated graph --- */
+  #graph-svg { width: 100%; height: auto; background: var(--panel2);
+               border: 1px solid var(--border); border-radius: 6px; }
+
+  .gnode rect {
+    fill: var(--panel); stroke: var(--border); stroke-width: 1.5;
+    transition: stroke .3s, fill .3s;
+  }
+  .gnode text { fill: var(--text); font-size: 12px; font-weight: 600; }
+  .gnode .sub { fill: var(--muted); font-size: 9px; font-weight: 400;
+                font-family: var(--mono); }
+
+  /* the running node: pulses */
+  .gnode.running rect {
+    stroke: var(--accent); stroke-width: 2.5;
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { stroke-opacity: 1;   filter: drop-shadow(0 0 2px var(--accent)); }
+    50%      { stroke-opacity: .45; filter: drop-shadow(0 0 8px var(--accent)); }
+  }
+
+  .gnode.done rect   { stroke: var(--accent2); fill: #16241d; }
+  .gnode.failed rect { stroke: var(--danger);  fill: #2a1a1a; }
+
+  /* color per provider - see at a glance which model works where */
+  .gnode.p-anthropic rect { stroke: #c084fc; }
+  .gnode.p-openai    rect { stroke: #3ddc97; }
+  .gnode.p-gemini    rect { stroke: #6ea8fe; }
+
+  .gedge { stroke: var(--border); stroke-width: 1.5; fill: none; }
+  .gedge.active { stroke: var(--accent); stroke-width: 2; }
+  .gedge-label { fill: var(--muted); font-size: 9px; font-family: var(--mono); }
+
+  /* THE PIXEL that travels along the edge */
+  .pixel { fill: var(--accent); }
+
+  /* --- the live journal below the graph --- */
+  #log-box {
+    max-height: 300px; overflow-y: auto; font-family: var(--mono); font-size: 12px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px;
+  }
+  .lg { display: flex; gap: 8px; padding: 3px 0; align-items: flex-start;
+        border-bottom: 1px solid rgba(255,255,255,.03); }
+  .lg:last-child { border-bottom: 0; }
+  .lg .t { color: var(--muted); flex-shrink: 0; min-width: 46px; }
+  .lg .who { flex-shrink: 0; min-width: 92px; font-weight: 600; }
+  .lg .what { flex: 1; word-break: break-word; white-space: pre-wrap; }
+
+  .lg.think .who  { color: var(--muted); }
+  .lg.think .what { color: var(--muted); font-style: italic; }
+  .lg.tool .who   { color: var(--accent); }
+  .lg.tool .what  { color: var(--text); }
+  .lg.res  .who   { color: var(--muted); }
+  .lg.res  .what  { color: var(--muted); }
+  .lg.res.err .what { color: var(--danger); }
+  .lg.says .who   { color: var(--accent2); }
+  .lg.says .what  { color: var(--text); }
+  .lg.node .who   { color: var(--accent); }
+  .lg.node .what  { color: var(--muted); }
+  .spin { display: inline-block; animation: sp 1s linear infinite; }
+
+  /* --- approval dialog: the agent is blocked, waiting for you --- */
+  #approval-overlay {
+    display: none; position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,.55);
+    align-items: center; justify-content: center;
+  }
+  #approval-overlay.show { display: flex; }
+  .approval-box {
+    background: var(--panel); border: 1px solid var(--accent);
+    border-radius: 10px; padding: 20px 22px; max-width: 520px; width: 90%;
+    box-shadow: 0 10px 40px rgba(0,0,0,.5);
+  }
+  .approval-box h3 { margin: 0 0 4px; font-size: 15px; color: var(--accent); }
+  .approval-box .meta { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  .approval-box .what {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px; font-family: var(--mono); font-size: 12px;
+    word-break: break-all; margin-bottom: 16px;
+  }
+  .approval-box .row { display: flex; gap: 8px; justify-content: flex-end; }
+  .approval-box button { padding: 8px 18px; }
+  .btn-deny { background: var(--bg); border: 1px solid var(--border); color: var(--text); }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>pixel<span>go</span></h1>
+  <span class="badge" id="ws-badge">no workspace</span>
+  <div class="tabs">
+    <div class="tab active" data-view="chat">Chat</div>
+    <div class="tab" data-view="agents">Agents</div>
+    <div class="tab" data-view="flows">Graphs</div>
+  </div>
+</header>
+
+<main>
+  <!-- CHAT -->
+  <div class="view active" id="view-chat">
+    <div class="side">
+      <h3>Workspace</h3>
+      <select id="ws-select"></select>
+      <h3>AI agents</h3>
+      <div id="chat-agents"></div>
+    </div>
+    <div class="chat-main">
+      <div class="messages" id="messages">
+        <div class="empty">Pick an agent on the left to begin.</div>
+      </div>
+      <div class="composer">
+        <textarea id="input" placeholder="Type a message... (Enter = send, Shift+Enter = new line)" disabled></textarea>
+        <button id="send" disabled>Send</button>
+        <button class="ghost" id="reset" disabled>Reset</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AGENTS -->
+  <div class="view" id="view-agents">
+    <div class="pane">
+      <div class="card">
+        <h2>New workspace</h2>
+        <div class="row" style="display:flex; gap:8px;">
+          <input id="new-ws" placeholder="workspace name">
+          <button id="create-ws">Create</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>New agent</h2>
+        <div class="row">
+          <label>Workspace</label>
+          <select id="ag-ws"></select>
+        </div>
+        <div class="grid2">
+          <div class="row">
+            <label>Agent ID</label>
+            <input id="ag-id" placeholder="ex: coder">
+          </div>
+          <div class="row">
+            <label>Type</label>
+            <select id="ag-type">
+              <option value="ai">AI (model-driven)</option>
+              <option value="worker">Worker (fixed command)</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="ai-fields">
+          <div class="grid2">
+            <div class="row">
+              <label>Provider</label>
+              <select id="ag-provider">
+                <option value="anthropic">anthropic</option>
+                <option value="openai">openai</option>
+                <option value="gemini">gemini</option>
+              </select>
+            </div>
+            <div class="row">
+              <label>Model</label>
+              <input id="ag-model" placeholder="claude-sonnet-5">
+            </div>
+          </div>
+          <div class="row">
+            <label>System prompt (the agent's role)</label>
+            <textarea id="ag-prompt" rows="3" placeholder="You are a programming assistant..."></textarea>
+          </div>
+          <div class="row">
+            <label>Tools</label>
+            <div class="checks" id="ag-tools">
+              <label><input type="checkbox" value="read_file"> read_file</label>
+              <label><input type="checkbox" value="write_file"> write_file</label>
+              <label><input type="checkbox" value="list_dir"> list_dir</label>
+              <label><input type="checkbox" value="search_files"> search_files</label>
+              <label><input type="checkbox" value="run_command"> run_command</label>
+            </div>
+            <div class="hint">No tools = pure chat. With tools = an assistant that can work.</div>
+          </div>
+          <div class="row" id="allow-row" style="display:none;">
+            <label>Allowed commands (allowlist for run_command)</label>
+            <input id="ag-allow" placeholder="gcc,make">
+            <div class="hint">Without an allowlist, run_command refuses everything (fail-closed).</div>
+          </div>
+          <div class="row">
+            <label>Ask me before these run</label>
+            <div class="checks" id="ag-approve">
+              <label><input type="checkbox" value="write_file"> write_file</label>
+              <label><input type="checkbox" value="run_command"> run_command</label>
+              <label><input type="checkbox" value="search_files"> search_files</label>
+            </div>
+            <div class="hint">
+              The agent pauses and waits for your decision. Leave empty to let it
+              run unsupervised.
+            </div>
+          </div>
+        </div>
+
+        <div id="worker-fields" style="display:none;">
+          <div class="row">
+            <label>Command</label>
+            <input id="ag-cmd" placeholder="/bin/echo">
+          </div>
+          <div class="row">
+            <label>Arguments (comma-separated)</label>
+            <input id="ag-args" placeholder="hello,world">
+          </div>
+        </div>
+
+        <button id="create-agent">Create agent</button>
+      </div>
+
+      <div class="card">
+        <h2>Existing agents</h2>
+        <div id="agent-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- GRAPHS -->
+  <div class="view" id="view-flows">
+    <div class="side">
+      <h3>Graphs</h3>
+      <div id="flow-list"></div>
+    </div>
+    <div class="pane">
+      <div class="card">
+        <h2>Run graph</h2>
+        <div class="row">
+          <label>Workspace</label>
+          <select id="fl-ws"></select>
+        </div>
+        <div class="row">
+          <label>Selected graph</label>
+          <input id="fl-file" readonly placeholder="pick from the left">
+        </div>
+        <div class="row">
+          <label>Initial task</label>
+          <textarea id="fl-task" rows="2" placeholder="Write a CSV parser..."></textarea>
+        </div>
+        <button id="run-flow" disabled>Run</button>
+        <div class="hint">The run is synchronous — it may take a while, depending on the agents.</div>
+      </div>
+
+      <div class="card">
+        <h2>New graph</h2>
+        <div class="row">
+          <label>Name</label>
+          <input id="nf-name" placeholder="my-graph">
+        </div>
+        <div class="row">
+          <label>Definition</label>
+          <textarea id="nf-body" rows="8" spellcheck="false"
+            placeholder="entry planner&#10;&#10;node planner&#10;node coder&#10;&#10;edge planner -> coder&#10;edge coder -> END"></textarea>
+        </div>
+        <button id="save-flow">Save graph</button>
+        <div class="hint">
+          Node names must match agent IDs in the workspace. Saved to demo/.
+          Conditional edges: <code>edge reviewer -&gt; coder when NEEDS_FIX</code>
+        </div>
+      </div>
+
+      <div class="card" id="graph-card">
+        <h2>Graph</h2>
+        <div id="graph-empty" class="empty" style="padding:40px 20px;">
+          Pick a graph on the left to see it drawn.
+        </div>
+        <svg id="graph-svg" viewBox="0 0 800 300" preserveAspectRatio="xMidYMid meet" style="display:none;"></svg>
+        <div class="hint" id="graph-hint" style="display:none;">
+          Run the graph to see the pixels circulating between agents.
+        </div>
+      </div>
+
+      <div class="card" id="log-card" style="display:none;">
+        <h2>What the agents are doing</h2>
+        <div id="log-box"></div>
+      </div>
+
+      <div class="card" id="diagram-card" style="display:none;">
+        <h2 style="cursor:pointer; user-select:none;" id="diagram-toggle">
+          <span id="diagram-arrow">▸</span> Export Mermaid
+        </h2>
+        <div id="diagram-body" style="display:none;">
+          <pre id="diagram"></pre>
+          <div class="hint">Paste it into GitHub, Notion or mermaid.live to see it drawn.</div>
+        </div>
+      </div>
+
+      <div class="card" id="flow-result" style="display:none;">
+        <h2>Result</h2>
+        <div id="flow-outputs"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<!-- Shown when an agent is blocked waiting for your decision. -->
+<div id="approval-overlay">
+  <div class="approval-box">
+    <h3>Approval needed</h3>
+    <div class="meta">
+      <span id="approval-agent"></span> wants to use
+      <strong id="approval-tool"></strong>
+    </div>
+    <div class="what" id="approval-what"></div>
+    <div class="row">
+      <button class="btn-deny" id="approval-deny">Deny</button>
+      <button id="approval-allow">Allow</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+
+let state = { ws: null, agent: null, flow: null, busy: false };
+
+function toast(msg, kind) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (kind || '');
+  setTimeout(() => t.className = 'toast', 2600);
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
+}
+
+/* ---------- tabs ---------- */
+$$('.tab').forEach(t => t.onclick = () => {
+  $$('.tab').forEach(x => x.classList.remove('active'));
+  $$('.view').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  $('#view-' + t.dataset.view).classList.add('active');
+  if (t.dataset.view === 'agents') loadAgentList();
+});
+
+/* ---------- workspaces ---------- */
+async function loadWorkspaces() {
+  const list = await api('/api/workspaces');
+  const opts = list.map(w => `<option value="${w.name}">${w.name} (${w.agent_count})</option>`).join('');
+  ['#ws-select', '#ag-ws', '#fl-ws'].forEach(sel => {
+    const el = $(sel);
+    const cur = el.value;
+    el.innerHTML = opts || '<option value="">(none)</option>';
+    if (cur) el.value = cur;
+  });
+  if (list.length && !state.ws) {
+    state.ws = list[0].name;
+    $('#ws-select').value = state.ws;
+  }
+  $('#ws-badge').textContent = state.ws || 'no workspace';
+  if (state.ws) loadChatAgents();
+}
+
+$('#ws-select').onchange = e => {
+  state.ws = e.target.value;
+  state.agent = null;
+  $('#ws-badge').textContent = state.ws;
+  $('#messages').innerHTML = '<div class="empty">Pick an agent.</div>';
+  setComposer(false);
+  loadChatAgents();
+};
+
+$('#create-ws').onclick = async () => {
+  const name = $('#new-ws').value.trim();
+  if (!name) return toast('Enter a name', 'err');
+  try {
+    await api('/api/workspaces', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name})
+    });
+    $('#new-ws').value = '';
+    toast('Workspace created', 'ok');
+    await loadWorkspaces();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+/* ---------- agents (chat sidebar) ---------- */
+async function loadChatAgents() {
+  if (!state.ws) return;
+  const agents = await api('/api/agents?ws=' + encodeURIComponent(state.ws));
+  const ai = agents.filter(a => a.type === 'ai');
+  const box = $('#chat-agents');
+  if (!ai.length) {
+    box.innerHTML = '<div class="hint">No AI agents. Create one in the Agents tab.</div>';
+    return;
+  }
+  box.innerHTML = ai.map(a => `
+    <div class="item ${state.agent === a.id ? 'active' : ''}" data-id="${a.id}">
+      ${a.id}
+      <div class="meta">${a.provider} · ${a.model}${a.tools.length ? ' · ' + a.tools.length + ' tool-uri' : ''}</div>
+    </div>`).join('');
+  box.querySelectorAll('.item').forEach(el => el.onclick = () => selectAgent(el.dataset.id));
+}
+
+async function selectAgent(id) {
+  state.agent = id;
+  loadChatAgents();
+  setComposer(true);
+  await loadHistory();
+}
+
+function setComposer(on) {
+  $('#input').disabled = !on;
+  $('#send').disabled = !on;
+  $('#reset').disabled = !on;
+}
+
+/* ---------- chat ---------- */
+function renderMessages(msgs) {
+  const box = $('#messages');
+  if (!msgs.length) {
+    box.innerHTML = '<div class="empty">New conversation. Type a message.</div>';
+    return;
+  }
+  box.innerHTML = msgs.map(m => {
+    const blocks = m.content || [];
+    return blocks.map(b => {
+      if (b.type === 'text')
+        return `<div class="msg ${m.role}"><div class="who">${m.role === 'user' ? 'You' : 'Agent'}</div><div class="text">${esc(b.text)}</div></div>`;
+      if (b.type === 'tool_use')
+        return `<div class="msg tool"><div class="who">tool → ${esc(b.name)}</div><div class="text">${esc(JSON.stringify(b.input))}</div></div>`;
+      if (b.type === 'tool_result')
+        return `<div class="msg tool"><div class="who">tool result</div><div class="text">${esc(String(b.content).slice(0, 600))}</div></div>`;
+      return '';
+    }).join('');
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function loadHistory() {
+  if (!state.ws || !state.agent) return;
+  try {
+    const h = await api(`/api/history?ws=${encodeURIComponent(state.ws)}&agent=${encodeURIComponent(state.agent)}`);
+    renderMessages(h);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* Waits for a job to finish, by polling. The server returns a job_id
+   immediately; the agent runs in a separate process. */
+async function waitJob(jobId, onTick) {
+  for (let i = 0; i < 600; i++) {          // max ~10 min
+    await new Promise(r => setTimeout(r, i < 10 ? 400 : 1000));
+    const j = await api('/api/jobs/' + encodeURIComponent(jobId));
+    if (onTick) onTick(j, i);
+    if (j.status === 'done') return j;
+    if (j.status === 'failed') throw new Error(j.error || 'job failed');
+  }
+  throw new Error('the job timed out');
+}
+
+async function send() {
+  const text = $('#input').value.trim();
+  if (!text || state.busy) return;
+
+  state.busy = true;
+  $('#input').value = '';
+  $('#send').disabled = true;
+
+  const box = $('#messages');
+  if (box.querySelector('.empty')) box.innerHTML = '';
+  box.innerHTML += `<div class="msg user"><div class="who">You</div><div class="text">${esc(text)}</div></div>`;
+  box.innerHTML += `<div class="msg assistant" id="pending"><div class="who">Agent</div><div class="text"><span class="spin">◐</span> thinking...</div></div>`;
+  box.scrollTop = box.scrollHeight;
+
+  try {
+    // 1. start the job (immediate response)
+    const start = await api('/api/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ws: state.ws, agent: state.agent, message: text})
+    });
+    if (!start.job_id) throw new Error(start.error || 'no job_id received');
+
+    // 2. wait for it to finish. We also stream events, because that is how an
+    //    approval request reaches us - without it the agent would block unseen.
+    streamEvents(start.job_id);   // no await: runs alongside the wait
+    await waitJob(start.job_id, (j, i) => {
+      const p = $('#pending');
+      if (p && i > 3)
+        p.querySelector('.text').innerHTML =
+          `<span class="spin">◐</span> working... (${Math.round(i * 0.9)}s)`;
+    });
+
+    // 3. reload the history (we also see the tools used)
+    streaming = false;   // the chat job is done; stop polling events
+    await loadHistory();
+  } catch (e) {
+    const p = $('#pending');
+    if (p) p.querySelector('.text').innerHTML =
+      `<span style="color:var(--danger)">${esc(e.message)}</span>`;
+    toast(e.message, 'err');
+  } finally {
+    state.busy = false;
+    $('#send').disabled = false;
+    $('#input').focus();
+  }
+}
+
+$('#send').onclick = send;
+$('#input').onkeydown = e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+};
+
+$('#reset').onclick = async () => {
+  if (!confirm('Clear the conversation history?')) return;
+  try {
+    await api('/api/history/reset', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ws: state.ws, agent: state.agent})
+    });
+    toast('History cleared', 'ok');
+    await loadHistory();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+/* ---------- creating an agent ---------- */
+$('#ag-type').onchange = e => {
+  const ai = e.target.value === 'ai';
+  $('#ai-fields').style.display = ai ? '' : 'none';
+  $('#worker-fields').style.display = ai ? 'none' : '';
+};
+
+$('#ag-tools').onchange = () => {
+  const run = $$('#ag-tools input:checked').some(c => c.value === 'run_command');
+  $('#allow-row').style.display = run ? '' : 'none';
+};
+
+$('#create-agent').onclick = async () => {
+  const ws = $('#ag-ws').value, id = $('#ag-id').value.trim();
+  if (!ws || !id) return toast('Workspace and ID are required', 'err');
+
+  const type = $('#ag-type').value;
+  const body = {ws, id, type};
+
+  if (type === 'ai') {
+    body.provider = $('#ag-provider').value;
+    body.model = $('#ag-model').value.trim();
+    body.system_prompt = $('#ag-prompt').value.trim();
+    body.tools = $$('#ag-tools input:checked').map(c => c.value);
+    const allow = $('#ag-allow').value.trim();
+    body.allowlist = allow ? allow.split(',').map(s => s.trim()).filter(Boolean) : [];
+    body.approval = $$('#ag-approve input:checked').map(c => c.value);
+    if (!body.model) return toast('The model is required', 'err');
+  } else {
+    body.command = $('#ag-cmd').value.trim();
+    const args = $('#ag-args').value.trim();
+    body.args = args ? args.split(',').map(s => s.trim()).filter(Boolean) : [];
+    if (!body.command) return toast('The command is required', 'err');
+  }
+
+  try {
+    await api('/api/agents', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    toast('Agent created', 'ok');
+    $('#ag-id').value = ''; $('#ag-prompt').value = '';
+    await loadWorkspaces();
+    await loadAgentList();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+async function loadAgentList() {
+  const ws = $('#ag-ws').value;
+  if (!ws) { $('#agent-list').innerHTML = '<div class="hint">No workspace.</div>'; return; }
+  const agents = await api('/api/agents?ws=' + encodeURIComponent(ws));
+  if (!agents.length) { $('#agent-list').innerHTML = '<div class="hint">No agents.</div>'; return; }
+  $('#agent-list').innerHTML = agents.map(a => `
+    <div class="item">
+      <b>${esc(a.id)}</b> <span class="badge">${a.type}</span>
+      ${a.approval && a.approval.length
+        ? `<span class="badge" title="asks before: ${esc(a.approval.join(', '))}">needs approval</span>`
+        : ''}
+      <div class="meta">${a.type === 'ai'
+        ? esc(a.provider + ' · ' + a.model) + (a.tools.length ? ' · tools: ' + a.tools.join(', ') : ' · no tools')
+        : esc(a.command)}</div>
+    </div>`).join('');
+}
+$('#ag-ws').onchange = loadAgentList;
+
+
+/* ============ THE ANIMATED GRAPH (pixels travel between agents) ============ */
+
+let graphState = { nodes: [], edges: [], pos: {}, entry: null };
+
+/* Layout: we place the nodes on LEVELS, by distance from entry (BFS).
+   Nodes on the same level run in parallel -> we put them next to each other. */
+function layoutGraph(nodes, edges, entry) {
+  // BFS by levels. CAREFUL: the graph may have LOOPS (reviewer -> coder when
+  // NEEDS_FIX). A naive relaxation ("always take the higher level") would grow the
+  // level forever on a cycle and freeze the browser.
+  // Solution: each node gets its level ONCE (first visit, BFS =
+  // the shortest distance from entry). The loop edge is drawn backward.
+  const level = {};
+  const queue = [entry];
+  level[entry] = 0;
+
+  while (queue.length) {
+    const n = queue.shift();
+    const d = level[n];
+
+    edges.filter(e => e.from === n).forEach(e => {
+      if (e.to === 'END') return;
+      if (level[e.to] !== undefined) return;   // already placed -> we do not re-visit (anti-cycle)
+      level[e.to] = d + 1;
+      queue.push(e.to);
+    });
+  }
+
+  // Fan-in: a node with several predecessors must come AFTER all of them. We do
+  // a few adjustment passes (not forever - we cap at the number of nodes).
+  for (let pass = 0; pass < nodes.length; pass++) {
+    let changed = false;
+    edges.forEach(e => {
+      if (e.to === 'END' || level[e.from] === undefined || level[e.to] === undefined) return;
+      // we ignore "backward" edges (loops): they do not force the order
+      if (level[e.to] <= level[e.from] && level[e.to] < level[e.from] + 1) {
+        // it is a backward edge only if the target was already placed earlier
+        const isBackEdge = level[e.to] <= level[e.from];
+        if (isBackEdge) return;
+      }
+      if (level[e.to] < level[e.from] + 1) {
+        level[e.to] = level[e.from] + 1;
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+  // unconnected nodes (should not happen, but defensive)
+  nodes.forEach(n => { if (level[n] === undefined) level[n] = 0; });
+
+  const hasEnd = edges.some(e => e.to === 'END');
+  const maxLevel = Math.max(...Object.values(level), 0);
+  if (hasEnd) level['END'] = maxLevel + 1;
+
+  // group by levels
+  const byLevel = {};
+  Object.entries(level).forEach(([n, l]) => {
+    (byLevel[l] = byLevel[l] || []).push(n);
+  });
+
+  const levels = Object.keys(byLevel).length;
+  const W = 800, H = Math.max(240, 90 * Math.max(...Object.values(byLevel).map(a => a.length)));
+  const colW = W / (levels + 0.6);
+
+  const pos = {};
+  Object.entries(byLevel).forEach(([l, ns]) => {
+    const x = colW * (Number(l) + 0.8);
+    const gap = H / (ns.length + 1);
+    ns.forEach((n, i) => { pos[n] = { x, y: gap * (i + 1) }; });
+  });
+
+  return { pos, W, H };
+}
+
+function renderGraph(nodes, edges, entry) {
+  const svg = $('#graph-svg');
+  const { pos, W, H } = layoutGraph(nodes, edges, entry);
+  graphState = { nodes, edges, pos, entry };
+
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  const NW = 108, NH = 42;   // node dimensions
+  let out = `<defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M1 1 L9 5 L1 9" fill="none" stroke="var(--border)" stroke-width="1.5"/>
+    </marker>
+  </defs>`;
+
+  // the edges (first, so they sit under the nodes)
+  edges.forEach((e, i) => {
+    const a = pos[e.from], b = pos[e.to];
+    if (!a || !b) return;
+
+    // curve: we exit the right of the source, enter the left of the target
+    const x1 = a.x + NW/2, y1 = a.y;
+    const x2 = b.x - NW/2, y2 = b.y;
+    const mx = (x1 + x2) / 2;
+    const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
+
+    out += `<path class="gedge" id="edge-${i}" d="${d}" marker-end="url(#arr)"/>`;
+
+    if (e.condition) {
+      out += `<text class="gedge-label" x="${mx}" y="${(y1+y2)/2 - 6}" text-anchor="middle">${esc(e.condition)}</text>`;
+    }
+  });
+
+  // nodurile
+  nodes.concat(edges.some(e => e.to === 'END') ? ['END'] : []).forEach(n => {
+    const p = pos[n];
+    if (!p) return;
+    const isEnd = n === 'END';
+    out += `<g class="gnode" id="node-${cssId(n)}">
+      <rect x="${p.x - NW/2}" y="${p.y - NH/2}" width="${NW}" height="${NH}" rx="7"
+            ${isEnd ? 'stroke-dasharray="4 3"' : ''}/>
+      <text x="${p.x}" y="${p.y - 2}" text-anchor="middle">${esc(n)}</text>
+      <text class="sub" x="${p.x}" y="${p.y + 12}" text-anchor="middle" id="sub-${cssId(n)}"></text>
+    </g>`;
+  });
+
+  svg.innerHTML = out;
+  $('#graph-empty').style.display = 'none';
+  svg.style.display = '';
+  $('#graph-hint').style.display = '';
+}
+
+function cssId(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+
+/* Sends a PIXEL along an edge: from `from` to `to`.
+   The pixel size grows with the message volume - you see visually where the
+   volume flows (and why you put the cheap model there). */
+function sendPixel(from, to, bytes) {
+  const idx = graphState.edges.findIndex(e => e.from === from && e.to === to);
+  if (idx < 0) return;
+
+  const path = document.getElementById('edge-' + idx);
+  if (!path) return;
+
+  path.classList.add('active');
+
+  const len = path.getTotalLength();
+  const svg = $('#graph-svg');
+
+  // radius: 3px base, grows with log(bytes) - capped at 8px
+  const r = Math.min(8, 3 + Math.log10(Math.max(1, bytes || 1)) * 1.2);
+
+  const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  dot.setAttribute('class', 'pixel');
+  dot.setAttribute('r', r.toFixed(1));
+  svg.appendChild(dot);
+
+  const DUR = 700;
+  const t0 = performance.now();
+
+  function step(now) {
+    const t = Math.min(1, (now - t0) / DUR);
+    const pt = path.getPointAtLength(len * t);
+    dot.setAttribute('cx', pt.x);
+    dot.setAttribute('cy', pt.y);
+    dot.setAttribute('opacity', t > 0.85 ? (1 - t) / 0.15 : 1);
+
+    if (t < 1) requestAnimationFrame(step);
+    else {
+      dot.remove();
+      setTimeout(() => path.classList.remove('active'), 200);
+    }
+  }
+  requestAnimationFrame(step);
+}
+
+/* --- the live journal: what the agents are doing --- */
+
+function logLine(kind, time, who, what) {
+  const box = $('#log-box');
+  const div = document.createElement('div');
+  div.className = 'lg ' + kind;
+  div.innerHTML =
+    `<span class="t">${(time/1000).toFixed(1)}s</span>` +
+    `<span class="who">${esc(who)}</span>` +
+    `<span class="what">${esc(what)}</span>`;
+  box.appendChild(div);
+
+  // auto-scroll only if the user is already at the bottom (we do not yank them if they are reading above)
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  if (nearBottom) box.scrollTop = box.scrollHeight;
+}
+
+/* Shortens a long text for the journal. */
+function short(s, n) {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+/* Applies an event to the graph. */
+function applyEvent(ev) {
+  const usd = m => '$' + (m / 1e6).toFixed(m > 0 && m < 10000 ? 4 : 2);
+
+  if (ev.t === 'approval_needed') {
+    logLine('tool', ev.ms, ev.node, `⏸ waiting for your approval: ${ev.tool}`);
+    showApproval(ev);
+  }
+
+  else if (ev.t === 'approval_done') {
+    hideApproval();
+    logLine(ev.allowed ? 'node' : 'res err', ev.ms, ev.node,
+            ev.allowed ? `✓ you allowed ${ev.tool}` : `✗ you denied ${ev.tool}`);
+  }
+
+  else if (ev.t === 'graph_start') {
+    $('#log-box').innerHTML = '';
+    $('#log-card').style.display = '';
+    logLine('node', ev.ms, '▶ start', `graph started (${ev.total_nodes} nodes)`);
+  }
+
+  else if (ev.t === 'node_start') {
+    const g = document.getElementById('node-' + cssId(ev.node));
+    if (g) {
+      g.classList.remove('done', 'failed');
+      g.classList.add('running');
+      if (ev.provider) g.classList.add('p-' + ev.provider);
+    }
+    const sub = document.getElementById('sub-' + cssId(ev.node));
+    if (sub) sub.textContent = ev.model || ev.provider || '';
+
+    logLine('node', ev.ms, ev.node, `▶ started (${ev.model || ev.provider || ''})`);
+  }
+
+  else if (ev.t === 'node_done') {
+    const g = document.getElementById('node-' + cssId(ev.node));
+    if (g) { g.classList.remove('running'); g.classList.add('done'); }
+
+    const secs = (ev.duration_ms / 1000).toFixed(1) + 's';
+    const sub = document.getElementById('sub-' + cssId(ev.node));
+    if (sub) {
+      sub.textContent = ev.cost_micro_usd > 0
+        ? `${usd(ev.cost_micro_usd)} · ${secs}`
+        : secs;
+    }
+
+    logLine('node', ev.ms, ev.node,
+            `✓ done in ${secs}` +
+            (ev.cost_micro_usd > 0
+              ? ` · ${usd(ev.cost_micro_usd)} · ${ev.input_tokens}+${ev.output_tokens} tok`
+              : ''));
+  }
+
+  else if (ev.t === 'node_failed') {
+    const g = document.getElementById('node-' + cssId(ev.node));
+    if (g) { g.classList.remove('running'); g.classList.add('failed'); }
+    logLine('res err', ev.ms, ev.node, `✗ failed: ${short(ev.error, 120)}`);
+  }
+
+  else if (ev.t === 'edge_flow') {
+    sendPixel(ev.from, ev.to, ev.bytes);
+
+    /* END is not an agent, so it emits no node_done. We mark it ourselves when the
+       pixel reaches it - otherwise it stayed gray, even though the graph ended there. */
+    if (ev.to === 'END') {
+      const g = document.getElementById('node-END');
+      if (g) setTimeout(() => g.classList.add('done'), 700);  // after the pixel animation
+    }
+  }
+
+  /* --- what happens INSIDE the agent --- */
+
+  else if (ev.t === 'agent_thinking') {
+    logLine('think', ev.ms, ev.node, `thinking... (step ${ev.iteration})`);
+  }
+
+  else if (ev.t === 'tool_call') {
+    const icon = { read_file:'📄', write_file:'✏️', list_dir:'📁',
+                   search_files:'🔍', run_command:'⚡' }[ev.tool] || '🔧';
+    logLine('tool', ev.ms, ev.node,
+            `${icon} ${ev.tool}${ev.input ? ': ' + short(ev.input, 90) : ''}`);
+  }
+
+  else if (ev.t === 'tool_result') {
+    const kind = ev.ok ? 'res' : 'res err';
+    const status = ev.ok ? '✓' : '✗';
+    logLine(kind, ev.ms, '',
+            `${status} ${short(ev.summary, 120)}${ev.bytes > 120 ? ` (${ev.bytes}B)` : ''}`);
+  }
+
+  else if (ev.t === 'agent_says') {
+    logLine('says', ev.ms, ev.node, short(ev.text, 400));
+  }
+
+  else if (ev.t === 'graph_done') {
+    /* safety: if END exists in the graph, we mark it finished */
+    const gend = document.getElementById('node-END');
+    if (gend) gend.classList.add('done');
+
+    const secs = (ev.total_ms / 1000).toFixed(1);
+    const msg = ev.total_cost_micro_usd > 0
+      ? `Finished in ${secs}s · total cost ${usd(ev.total_cost_micro_usd)}`
+      : `Finished in ${secs}s`;
+    $('#graph-hint').textContent = msg;
+    logLine('node', ev.ms, '■ done', msg);
+  }
+
+  else if (ev.t === 'graph_failed') {
+    logLine('res err', ev.ms, '■ failure', short(ev.error, 200));
+  }
+}
+
+/* Consumes a job's events, at the pace they appear. */
+/* The job whose events we are streaming - the approval dialog posts back to it. */
+let approvalJobId = null;
+
+function showApproval(ev) {
+  $('#approval-agent').textContent = ev.node || 'an agent';
+  $('#approval-tool').textContent  = ev.tool || '';
+  $('#approval-what').textContent  = ev.input || '(no details)';
+  $('#approval-overlay').classList.add('show');
+}
+
+function hideApproval() {
+  $('#approval-overlay').classList.remove('show');
+}
+
+async function sendApproval(allow) {
+  if (!approvalJobId) return;
+  /* Hide immediately: the agent may take a moment to notice the decision, and
+     leaving the dialog up makes it look like the click did not register. */
+  hideApproval();
+  try {
+    await api(`/api/jobs/${encodeURIComponent(approvalJobId)}/approve`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ allow })
+    });
+  } catch (e) {
+    toast('Could not send the decision: ' + e.message, 'err');
+  }
+}
+
+$('#approval-allow').onclick = () => sendApproval(true);
+$('#approval-deny').onclick  = () => sendApproval(false);
+
+/* Set to false to stop an in-flight event stream (a chat job has no
+   graph_done event to end it naturally). */
+let streaming = false;
+
+async function streamEvents(jobId) {
+  approvalJobId = jobId;
+  streaming = true;
+  let from = 0;
+
+  for (let i = 0; i < 900 && streaming; i++) {   // max ~15 min
+    let r;
+    try {
+      r = await api(`/api/jobs/${encodeURIComponent(jobId)}/events?from=${from}`);
+    } catch (e) { break; }
+
+    (r.events || []).forEach(applyEvent);
+    from = r.next || from;
+
+    const last = (r.events || [])[r.events.length - 1];
+    if (last && (last.t === 'graph_done' || last.t === 'graph_failed')) break;
+
+    await new Promise(res => setTimeout(res, 350));
+  }
+  streaming = false;
+}
+
+/* ---------- graphs ---------- */
+async function loadFlows() {
+  const flows = await api('/api/flows');
+  $('#flow-list').innerHTML = flows.length
+    ? flows.map(f => `<div class="item" data-f="${f}">${f.replace('examples/', '')}</div>`).join('')
+    : '<div class="hint">No .flow files yet</div>';
+  $$('#flow-list .item').forEach(el => el.onclick = () => selectFlow(el.dataset.f));
+}
+
+$('#save-flow').onclick = async () => {
+  const name = $('#nf-name').value.trim();
+  const content = $('#nf-body').value.trim();
+  if (!name)    return toast('Enter a name', 'err');
+  if (!content) return toast('The graph is empty', 'err');
+
+  const btn = $('#save-flow');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/flows', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name, content })
+    });
+    toast('Graph saved', 'ok');
+    $('#nf-name').value = '';
+    $('#nf-body').value = '';
+    await loadFlows();
+    selectFlow(r.saved);          // select it so you can run it right away
+  } catch (e) {
+    toast(e.message, 'err');      // e.g. invalid syntax: nothing was written
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+async function selectFlow(f) {
+  state.flow = f;
+  $$('#flow-list .item').forEach(el =>
+    el.classList.toggle('active', el.dataset.f === f));
+  $('#fl-file').value = f;
+  $('#run-flow').disabled = false;
+
+  try {
+    // the graph structure -> we draw it (SVG)
+    const gr = await api('/api/flow/graph', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({flow: f})
+    });
+    if (!gr.nodes || !gr.nodes.length) throw new Error('the graph has no nodes');
+    renderGraph(gr.nodes, gr.edges || [], gr.entry);
+    $('#graph-hint').textContent = 'Run the graph to see the pixels circulating between agents.';
+
+    // and Mermaid, for whoever wants to export it
+    const r = await api('/api/flow/diagram', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({flow: f})
+    });
+    $('#diagram').textContent = r.mermaid;
+    $('#diagram-card').style.display = '';
+  } catch (e) {
+    // the error must be VISIBLE on the page, not just a toast that disappears
+    $('#graph-empty').innerHTML =
+      `<span style="color:var(--danger)">Could not draw the graph: ${esc(e.message)}</span>`;
+    $('#graph-empty').style.display = '';
+    $('#graph-svg').style.display = 'none';
+    toast(e.message, 'err');
+  }
+}
+
+$('#run-flow').onclick = async () => {
+  const ws = $('#fl-ws').value;
+  if (!ws || !state.flow) return toast('Pick a workspace and graph', 'err');
+
+  const btn = $('#run-flow');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin">◐</span> running...';
+  $('#flow-result').style.display = 'none';
+
+  try {
+    const start = await api('/api/flow/run', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ws, flow: state.flow, task: $('#fl-task').value.trim()})
+    });
+    if (!start.job_id) throw new Error(start.error || 'no job_id received');
+
+    // reset the graph and start the animation in parallel with the waiting
+    renderGraph(graphState.nodes, graphState.edges, graphState.entry);
+    $('#graph-hint').textContent = 'Running...';
+    $('#log-box').innerHTML = '';
+    $('#log-card').style.display = '';
+    streamEvents(start.job_id);   // no await: runs in parallel
+
+    const j = await waitJob(start.job_id, (job, i) => {
+      btn.innerHTML = `<span class="spin">◐</span> running... (${Math.round(i * 0.9)}s)`;
+    });
+
+    const outs = j.outputs || [];
+    const usd = m => '$' + (m / 1e6).toFixed((m > 0 && m < 10000) ? 4 : 2);
+
+    // Cost summary - this is the demonstration: what it REALLY cost vs everything on the expensive model
+    let summary = '';
+    const totalCost = j.total_cost_micro_usd || 0;
+    if (totalCost > 0) {
+      // the most expensive model used (by output cost/token)
+      let worst = null, worstRate = 0;
+      outs.forEach(o => {
+        if (!o.output_tokens || !o.cost_micro_usd) return;
+        const rate = o.cost_micro_usd / (o.input_tokens + o.output_tokens || 1);
+        if (rate > worstRate) { worstRate = rate; worst = o.model; }
+      });
+      const totalTok = (j.total_input_tokens || 0) + (j.total_output_tokens || 0);
+      const alt = worstRate * totalTok;
+      const saved = alt - totalCost;
+      const pct = alt > 0 ? Math.round(100 - (totalCost * 100 / alt)) : 0;
+
+      summary = `<div class="cost-summary">
+        <div class="cost-box"><div class="label">Actual cost</div><div class="value">${usd(totalCost)}</div></div>
+        <div class="cost-box"><div class="label">Tokens</div><div class="value">${(totalTok/1000).toFixed(1)}k</div></div>
+        ${saved > 0 ? `
+        <div class="cost-box"><div class="label">All on ${esc(worst || '?')}</div><div class="value">${usd(alt)}</div></div>
+        <div class="cost-box saved"><div class="label">Saved</div><div class="value">${usd(saved)} · ${pct}%</div></div>` : ''}
+      </div>`;
+    }
+
+    $('#flow-outputs').innerHTML = summary + (outs.length
+      ? outs.map(o => {
+          const meta = o.model
+            ? `<div class="node-cost">${esc(o.model)} · ${o.input_tokens||0} in · ${o.output_tokens||0} out · ${usd(o.cost_micro_usd||0)}</div>`
+            : '';
+          return `<div class="row"><label>${esc(o.node)}</label>${meta}<pre>${esc(o.output || '(no output)')}</pre></div>`;
+        }).join('')
+      : '<div class="hint">No output.</div>');
+    $('#flow-result').style.display = '';
+    toast('Graph finished', 'ok');
+  } catch (e) {
+    toast(e.message, 'err');
+    $('#flow-outputs').innerHTML = `<div class="hint" style="color:var(--danger)">${esc(e.message)}</div>`;
+    $('#flow-result').style.display = '';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run';
+  }
+};
+
+$('#diagram-toggle').onclick = () => {
+  const b = $('#diagram-body');
+  const open = b.style.display !== 'none';
+  b.style.display = open ? 'none' : '';
+  $('#diagram-arrow').textContent = open ? '▸' : '▾';
+};
+
+/* ---------- init ---------- */
+(async () => {
+  try {
+    await loadWorkspaces();
+    await loadFlows();
+  } catch (e) { toast('Cannot reach the server', 'err'); }
+})();
+</script>
+</body>
+</html>
