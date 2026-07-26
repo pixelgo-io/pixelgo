@@ -225,6 +225,10 @@
   .lg.says .what  { color: var(--text); }
   .lg.node .who   { color: var(--accent); }
   .lg.node .what  { color: var(--muted); }
+  /* live command output: dimmed and indented, so it reads as a stream flowing
+     under the command that produced it rather than as separate events */
+  .lg.out  .what  { color: var(--muted); opacity: .75; padding-left: 10px;
+                    border-left: 2px solid var(--border); }
   .spin { display: inline-block; animation: sp 1s linear infinite; }
 
   /* --- approval dialog: the agent is blocked, waiting for you --- */
@@ -1035,6 +1039,13 @@ function applyEvent(ev) {
             `${icon} ${ev.tool}${ev.input ? ': ' + short(ev.input, 90) : ''}`);
   }
 
+  /* Live output from a command that is still running. No agent name and no
+     icon: these arrive in bursts, and repeating the name on every line would
+     bury the events that actually mark progress. */
+  else if (ev.t === 'tool_output') {
+    logLine('out', ev.ms, '', short(ev.chunk, 160));
+  }
+
   else if (ev.t === 'tool_result') {
     const kind = ev.ok ? 'res' : 'res err';
     const status = ev.ok ? '✓' : '✗';
@@ -1106,17 +1117,31 @@ async function streamEvents(jobId) {
   streaming = true;
   let from = 0;
 
-  for (let i = 0; i < 900 && streaming; i++) {   // max ~15 min
+  /* The cap is a safety net against polling forever, not a time budget: a
+     Docker-based flow can legitimately run for half an hour. Since the loop
+     only pauses when it is actually up to date, iterations no longer map to
+     wall-clock time. */
+  for (let i = 0; i < 20000 && streaming; i++) {
     let r;
     try {
       r = await api(`/api/jobs/${encodeURIComponent(jobId)}/events?from=${from}`);
     } catch (e) { break; }
 
-    (r.events || []).forEach(applyEvent);
-    from = r.next || from;
+    const batch = r.events || [];
+    batch.forEach(applyEvent);
 
-    const last = (r.events || [])[r.events.length - 1];
+    const advanced = (typeof r.next === 'number') && r.next > from;
+    if (advanced) from = r.next;
+
+    const last = batch[batch.length - 1];
     if (last && (last.t === 'graph_done' || last.t === 'graph_failed')) break;
+
+    /* The server returns events in bounded batches, so a full batch means
+       there is more waiting. Fetch it immediately instead of sleeping - a
+       build that streamed thousands of output lines would otherwise take
+       minutes to catch up, and the approval dialog would arrive far too late
+       to answer. */
+    if (advanced && batch.length > 0) continue;
 
     await new Promise(res => setTimeout(res, 350));
   }
