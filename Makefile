@@ -115,12 +115,21 @@ third_party/cJSON/cJSON.o: third_party/cJSON/cJSON.c
 src/web/web_assets.c: web/index.html tools/embed_html.sh
 	./tools/embed_html.sh web/index.html src/web/web_assets.c
 
+# -MMD -MP makes the compiler emit a .d file listing the headers each object
+# actually included; -include pulls those in below. Without this, editing a
+# header rebuilt nothing, and the tree silently went inconsistent: objects
+# compiled against the old definition linked happily with ones compiled against
+# the new. A struct or a buffer size changing under half the program that way is
+# hard to see and produces failures that make no sense.
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+-include $(OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
 clean:
 	rm -f $(TEST_BIN)
-	rm -f $(OBJ) $(BIN)
+	rm -f $(OBJ) $(OBJ:.o=.d) $(BIN)
+	rm -f $(shell find tests -name '*.d' 2>/dev/null)
 	rm -rf workspaces jobs
 	rm -f pixelgo.pid pixelgo.log
 

@@ -2,6 +2,7 @@
 #include "sandbox.h"
 #include "json_util.h"
 #include "log.h"
+#include "events.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +81,62 @@ static void allowlist_to_string(agent_t *agent, char *out, size_t out_size) {
     }
 }
 
+/*
+ * ---------------------------------------------------------------- streaming
+ *
+ * The output of a long command used to be invisible until it finished: we read
+ * it into a buffer and returned the whole thing at the end. Fine for `gcc -c`,
+ * useless for `docker compose build`, which runs for minutes behind a silent UI.
+ *
+ * So we also publish the output AS IT ARRIVES, line by line, to the event
+ * journal. Two rules keep this from becoming noise:
+ *
+ *   - we emit whole LINES, not raw read() chunks, because a chunk boundary
+ *     falls wherever the pipe happened to fill up and produces torn words;
+ *   - a line that never terminates (a progress bar redrawing with \r, which is
+ *     exactly what docker does) is flushed once it grows past STREAM_LINE_MAX,
+ *     so the journal keeps moving instead of waiting for a newline that is not
+ *     coming.
+ *
+ * What the MODEL receives is unchanged - it still gets one coherent result at
+ * the end. This is purely for the human watching.
+ */
+#define STREAM_LINE_MAX 400
+
+typedef struct {
+    char   line[STREAM_LINE_MAX + 1];
+    size_t len;
+    const char *tool;
+    int    enabled;
+} stream_ctx_t;
+
+static void stream_flush(stream_ctx_t *s) {
+    if (!s->enabled || s->len == 0) return;
+    s->line[s->len] = 0;
+    event_tool_output(NULL, s->tool, s->line);
+    s->len = 0;
+}
+
+/* Feeds newly-read bytes into the line buffer, emitting complete lines. */
+static void stream_feed(stream_ctx_t *s, const char *data, size_t n) {
+    if (!s->enabled) return;
+
+    for (size_t i = 0; i < n; i++) {
+        char c = data[i];
+
+        /* '\r' ends a line for our purposes too: progress bars use it to redraw
+           in place, and treating it as a terminator is what makes them show up
+           as successive journal lines instead of one endless one. */
+        if (c == '\n' || c == '\r') {
+            stream_flush(s);
+            continue;
+        }
+
+        s->line[s->len++] = c;
+        if (s->len >= STREAM_LINE_MAX) stream_flush(s);
+    }
+}
+
 tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
     cJSON *args = json_parse(input_json);
     if (!args || !cJSON_IsObject(args)) {
@@ -144,8 +201,26 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
     cJSON *t = cJSON_GetObjectItemCaseSensitive(args, "timeout_seconds");
     if (cJSON_IsNumber(t) && t->valuedouble > 0) timeout = (long)t->valuedouble;
 
-    LOG_I("run_command: agent=%s runs '%s' (%d arguments, timeout=%lds)",
-          agent->id, cmd, argc - 1, timeout);
+    /*
+     * Log the command WITH its arguments.
+     *
+     * Logging only the name and a count made post-hoc auditing impossible: a
+     * line reading "runs 'docker' (4 arguments)" tells you nothing about
+     * whether the agent mounted a host path it should not have. The arguments
+     * are the part worth keeping.
+     */
+    char cmdline[1024];
+    size_t off = 0;
+    for (int i = 0; i < argc && off < sizeof(cmdline) - 1; i++) {
+        int w = snprintf(cmdline + off, sizeof(cmdline) - off,
+                         "%s%s", i ? " " : "", argv[i]);
+        if (w < 0) break;
+        off += (size_t)w;
+    }
+    cmdline[sizeof(cmdline) - 1] = 0;
+
+    LOG_I("run_command: agent=%s runs: %s (timeout=%lds)",
+          agent->id, cmdline, timeout);
 
     /* --- pipe for capturing the output (stdout + stderr combined) --- */
     int pipefd[2];
@@ -212,12 +287,56 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
     int flags = fcntl(pipefd[0], F_GETFL, 0);
     fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
 
-    for (;;) {
-        if (total >= TOOL_RESULT_MAX - 1) { buffer_full = 1; break; }
+    /* Streaming is a no-op outside a web job: events_open_from_env() found no
+       journal, so the emit calls fall through and cost nothing. The CLI keeps
+       behaving exactly as before. */
+    stream_ctx_t stream = { {0}, 0, "run_command", 1 };
 
-        ssize_t n = read(pipefd[0], r.output + total, TOOL_RESULT_MAX - 1 - total);
+    /*
+     * A ring of the most recent output, used once the main buffer is full.
+     *
+     * Truncating from the front is the wrong end. A build prints its package
+     * list first and its verdict last, so keeping the first 8 KB gave the model
+     * apt chatter and threw away the line saying whether it worked.
+     *
+     * Worse, the old code broke out of the loop when the buffer filled and fell
+     * through to the kill path below - so a long build was terminated for being
+     * verbose, leaving containers half-created. We now keep draining the pipe
+     * and let the command finish; only the middle of its output is lost.
+     */
+    char tail[TOOL_TAIL_KEEP];
+    size_t tail_len = 0;
+    int    tail_wrapped = 0;
+    size_t dropped = 0;
+
+    for (;;) {
+        char scratch[4096];
+        char *dst;
+        size_t cap;
+
+        if (!buffer_full && total < TOOL_RESULT_MAX - 1) {
+            dst = r.output + total;
+            cap = TOOL_RESULT_MAX - 1 - total;
+        } else {
+            buffer_full = 1;
+            dst = scratch;
+            cap = sizeof(scratch);
+        }
+
+        ssize_t n = read(pipefd[0], dst, cap);
         if (n > 0) {
-            total += (size_t)n;
+            stream_feed(&stream, dst, (size_t)n);
+
+            if (dst == scratch) {
+                /* Past the main buffer: remember only the tail. */
+                dropped += (size_t)n;
+                for (ssize_t i = 0; i < n; i++) {
+                    tail[tail_len++] = scratch[i];
+                    if (tail_len == sizeof(tail)) { tail_len = 0; tail_wrapped = 1; }
+                }
+            } else {
+                total += (size_t)n;
+            }
             continue;
         }
         if (n == 0) { got_eof = 1; break; }   /* the command closed the pipe */
@@ -230,6 +349,12 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
         }
         break;  /* a real read error */
     }
+
+    /* Whatever sat in the line buffer when the loop ended - a last line with no
+       trailing newline, or a partial progress line - still belongs in the
+       journal. This matters most on the timeout path: the partial output is the
+       only clue about where the command actually got stuck. */
+    stream_flush(&stream);
 
     r.output[total] = 0;
     close(pipefd[0]);
@@ -247,15 +372,82 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
                         "--- Partial output ---\n%s", cmd, timeout, r.output);
     }
 
-    /* --- BUFFER FULL: we stop the command, return what we caught --- */
+    /* --- BUFFER FULL: the command ran to completion; we kept head and tail --- */
     if (buffer_full) {
-        int status;
-        kill(-pid, SIGTERM);
-        waitpid(pid, &status, 0);
-        LOG_W("run_command: output of '%s' exceeded %d bytes, truncated",
-              cmd, TOOL_RESULT_MAX);
-        return tool_ok("Output truncated at %d bytes.\n\n--- Output ---\n%s",
-                       TOOL_RESULT_MAX, r.output);
+        /*
+         * Reassemble the ring into reading order. If it never wrapped, the tail
+         * is simply the first tail_len bytes; if it did, the oldest byte sits at
+         * tail_len and the buffer reads around from there.
+         */
+        char tail_ordered[TOOL_TAIL_KEEP + 1];
+        size_t tn = 0;
+        if (tail_wrapped) {
+            for (size_t i = tail_len; i < sizeof(tail); i++) tail_ordered[tn++] = tail[i];
+            for (size_t i = 0; i < tail_len; i++)            tail_ordered[tn++] = tail[i];
+        } else {
+            for (size_t i = 0; i < tail_len; i++)            tail_ordered[tn++] = tail[i];
+        }
+        tail_ordered[tn] = 0;
+
+        /* Start the tail at a line boundary - resuming mid-line reads as
+           corruption to whoever is looking at it. */
+        char *tail_start = tail_ordered;
+        if (tail_wrapped) {
+            char *nl = strchr(tail_ordered, '\n');
+            if (nl && (size_t)(nl - tail_ordered) < tn - 1) tail_start = nl + 1;
+        }
+
+        LOG_W("run_command: output of '%s' exceeded %d bytes, dropped %zu bytes "
+              "from the middle", cmd, TOOL_RESULT_MAX, dropped);
+
+        /*
+         * Trim the head so that head + notice + tail fits in the result buffer,
+         * and copy it aside first.
+         *
+         * The copy is not defensive tidiness: tool_ok() formats INTO a
+         * tool_result_t's output field while reading r.output as an argument.
+         * Passing the same storage as both source and destination is undefined,
+         * and in practice the tail came out empty.
+         *
+         * Cut first, THEN back up to a line boundary - searching the untrimmed
+         * string finds the last newline of the whole 32 KB, which is not a cut
+         * point at all.
+         */
+        static char head[TOOL_RESULT_MAX];
+        size_t room = TOOL_RESULT_MAX - strlen(tail_start) - 256;
+        if (room > total) room = total;
+
+        memcpy(head, r.output, room);
+        head[room] = 0;
+        if (room < total) {
+            char *nl = strrchr(head, '\n');
+            if (nl) *nl = 0;
+        }
+
+        int status = 0;
+        pid_t w;
+        do { w = waitpid(pid, &status, 0); } while (w < 0 && errno == EINTR);
+
+        int code = -1;
+        if (w == pid) {
+            if (WIFEXITED(status))        code = WEXITSTATUS(status);
+            else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
+        }
+
+        if (code == 0)
+            return tool_ok("Exit code: 0 (success)\n"
+                           "Note: %zu bytes from the middle of the output were dropped.\n\n"
+                           "--- Output (start) ---\n%s\n"
+                           "--- [%zu bytes omitted] ---\n"
+                           "--- Output (end) ---\n%s",
+                           dropped, head, dropped, tail_start);
+
+        return tool_err("Exit code: %d (failure)\n"
+                        "Note: %zu bytes from the middle of the output were dropped.\n\n"
+                        "--- Output (start) ---\n%s\n"
+                        "--- [%zu bytes omitted] ---\n"
+                        "--- Output (end) ---\n%s",
+                        code, dropped, head, dropped, tail_start);
     }
 
     /* --- NORMAL (EOF or read error): we wait for the command and report --- */

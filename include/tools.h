@@ -3,7 +3,26 @@
 
 #include "agent.h"
 
-#define TOOL_RESULT_MAX 8192
+/*
+ * How much output a tool may return to the model.
+ *
+ * This is a context-window budget, not a disk limit: every byte here is resent
+ * on every subsequent turn, so a large value spends tokens for the rest of the
+ * agent's run. But too small is worse than expensive - a build that overflows
+ * it gets cut short, and the model is asked to debug from a fragment.
+ *
+ * 32 KB is chosen against real output: `docker compose up --build` for a PHP
+ * image runs to roughly 20-30 KB once apt is pulling packages. At 8 KB that
+ * build was truncated every time, and the truncation landed in the middle of
+ * the package list - the part that says whether it worked never arrived.
+ */
+#define TOOL_RESULT_MAX 32768
+
+/* How much of the END of an oversized output to keep. A command that overflows
+   the buffer usually says what went wrong in its last lines, so we keep the
+   head (what it set out to do) and the tail (how it ended), dropping the
+   middle. */
+#define TOOL_TAIL_KEEP 4096
 
 /* The result of executing a tool - always text, so it can be sent straight to the model */
 typedef struct {

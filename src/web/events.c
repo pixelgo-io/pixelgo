@@ -299,3 +299,25 @@ void event_agent_says(const char *node, const char *text) {
     emit("{\"t\":\"agent_says\",\"ms\":%lld,\"node\":\"%s\",\"text\":\"%s\"}",
          now_ms() - g_start_ms, n, t);
 }
+
+/*
+ * Live output from a running command.
+ *
+ * The chunk is capped well below the journal's other fields: these arrive many
+ * times per command, and a single build line is rarely useful past a couple of
+ * hundred characters. json_escape drops control characters, which also strips
+ * the ANSI colour codes docker emits - welcome here, since the journal renders
+ * as plain text.
+ */
+void event_tool_output(const char *node, const char *tool, const char *chunk) {
+    if (!chunk || !chunk[0]) return;
+
+    char n[128], t[64], c[512];
+    json_escape(node && node[0] ? node : g_node, n, sizeof(n));
+    json_escape(tool ? tool : "", t, sizeof(t));
+    json_escape(chunk, c, sizeof(c));
+    if (!c[0]) return;   /* the chunk was only control characters */
+
+    emit("{\"t\":\"tool_output\",\"ms\":%lld,\"node\":\"%s\",\"tool\":\"%s\",\"chunk\":\"%s\"}",
+         now_ms() - g_start_ms, n, t, c);
+}

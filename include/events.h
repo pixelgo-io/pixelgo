@@ -89,6 +89,21 @@ void event_tool_result(const char *node, const char *tool, int ok,
 void event_agent_says(const char *node, const char *text);
 
 /*
+ * A chunk of output from a command that is STILL RUNNING.
+ *
+ * Why this exists: run_command buffers everything and returns it only when the
+ * command exits. For `gcc -c file.c` that is invisible, but a `docker compose
+ * build` runs for minutes, and until now the journal showed the command
+ * starting and then nothing at all - no way to tell a slow build from a hung
+ * one.
+ *
+ * These events are for the HUMAN watching. The model still receives one
+ * coherent result at the end, exactly as before - streaming does not change
+ * what the agent sees, only what you see.
+ */
+void event_tool_output(const char *node, const char *tool, const char *chunk);
+
+/*
  * Human-in-the-loop approval, for agents running as a web job.
  *
  * The agent cannot ask on stdin here: it runs in a grandchild process with no

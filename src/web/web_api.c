@@ -684,7 +684,23 @@ static void route_job_approve(const http_req_t *req, http_res_t *res) {
  * The frontend polls and receives only the NEW events (from index N), so it does
  * not retransmit the whole journal on each request.
  * Response: {"events":[...], "next":N}
+ *
+ * Events are returned in BOUNDED batches. This matters more than it looks: the
+ * response is serialized into a fixed buffer, and json_serialize refuses to
+ * truncate (truncated JSON is invalid JSON), so an oversized batch used to fall
+ * through to an empty response with `next` unchanged. The client then asked for
+ * the same range again, got empty again, and the UI silently stopped updating -
+ * including the approval dialog, leaving the agent waiting for a decision the
+ * human was never shown.
+ *
+ * A single `docker compose build` streams enough output to blow past any
+ * reasonable buffer, so this is the normal case, not an edge case. Capping the
+ * batch keeps every response well inside the buffer; the client simply comes
+ * back for the rest, which it already does on every poll.
  */
+#define EVENTS_MAX_BATCH      400      /* events per response  */
+#define EVENTS_MAX_BODY     98304      /* 96 KB, well under the 128 KB buffer */
+
 static void route_job_events(const http_req_t *req, http_res_t *res) {
     /* extract the id: /api/jobs/<id>/events */
     char id[JOB_ID_LEN];
@@ -719,15 +735,26 @@ static void route_job_events(const http_req_t *req, http_res_t *res) {
     cJSON *arr = cJSON_CreateArray();
     char line[2048];
     int index = 0;
+    int sent = 0;
+    size_t bytes = 0;
 
     while (fgets(line, sizeof(line), f)) {
-        if (index++ < from) continue;   /* skip what the client already received */
+        if (index < from) { index++; continue; }   /* already delivered */
+
+        /* Stop at either cap. `index` is not advanced for what we do not send,
+           so `next` points exactly at the first event the client still needs. */
+        if (sent >= EVENTS_MAX_BATCH || bytes >= EVENTS_MAX_BODY) break;
 
         line[strcspn(line, "\n")] = 0;
-        if (!line[0]) continue;
+        if (!line[0]) { index++; continue; }
 
         cJSON *ev = cJSON_Parse(line);
-        if (ev) cJSON_AddItemToArray(arr, ev);
+        if (ev) {
+            cJSON_AddItemToArray(arr, ev);
+            bytes += strlen(line) + 2;   /* the comma and quoting overhead */
+            sent++;
+        }
+        index++;
     }
     fclose(f);
 
@@ -736,8 +763,18 @@ static void route_job_events(const http_req_t *req, http_res_t *res) {
     cJSON_AddNumberToObject(o, "next", index);
 
     char out[131072];
-    if (!json_serialize(o, out, sizeof(out)))
-        snprintf(out, sizeof(out), "{\"events\":[],\"next\":%d}", from);
+    if (!json_serialize(o, out, sizeof(out))) {
+        /*
+         * Should be unreachable now that batches are capped, but if it ever
+         * happens we must not hand back `next` unchanged - that is the silent
+         * stall this whole function is written to avoid. Advancing past one
+         * event loses that event and keeps the stream moving, which is the
+         * lesser harm, and the log says so plainly.
+         */
+        LOG_W("events: job %s batch did not fit at index %d, skipping one event",
+              id, from);
+        snprintf(out, sizeof(out), "{\"events\":[],\"next\":%d}", from + 1);
+    }
     cJSON_Delete(o);
     http_res_json(res, 200, out);
 }

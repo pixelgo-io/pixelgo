@@ -393,8 +393,11 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
        tool_use -> result -> tool_use -> ... -> final response). */
     usage_t total_usage = {0, 0, 0};
 
-    for (int iter = 0; iter < AI_LOOP_MAX_ITERATIONS; iter++) {
-        LOG_I("ai_loop: agent=%s iteration=%d -> call %s (%s)", agent->id, iter + 1,
+    const int max_iterations = ai_loop_max_iterations();
+
+    for (int iter = 0; iter < max_iterations; iter++) {
+        LOG_I("ai_loop: agent=%s iteration=%d/%d -> call %s (%s)",
+              agent->id, iter + 1, max_iterations,
               provider_to_string(agent->cfg.ai.provider), agent->cfg.ai.model);
 
         event_agent_thinking(agent->id, iter + 1);
@@ -505,8 +508,10 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
     }
 
     if (rc != 0)
-        LOG_E("ai_loop: agent=%s stopped without a final response (error or iteration limit)",
-              agent->id);
+        LOG_E("ai_loop: agent=%s stopped without a final response "
+              "(provider error, or the %d-iteration limit was reached - "
+              "raise it with PIXELGO_MAX_ITERATIONS)",
+              agent->id, max_iterations);
 
     /* We report usage: how many tokens, how much it cost. This is the number that
        supports the argument "the cheap model does the volume, the expensive one only
@@ -547,6 +552,27 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
 }
 
 /* The classic variant: one-shot, without persistent history, output to stdout. */
+/*
+ * The iteration ceiling, overridable at runtime.
+ *
+ * Clamped to a sane range: zero or negative would stop the agent before it did
+ * anything, and an unbounded value turns a stuck model into an unbounded bill.
+ */
+int ai_loop_max_iterations(void) {
+    const char *env = getenv("PIXELGO_MAX_ITERATIONS");
+    if (!env || !env[0]) return AI_LOOP_MAX_ITERATIONS;
+
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env || v < 1) {
+        LOG_W("PIXELGO_MAX_ITERATIONS='%s' is not a positive number, using %d",
+              env, AI_LOOP_MAX_ITERATIONS);
+        return AI_LOOP_MAX_ITERATIONS;
+    }
+    if (v > 500) v = 500;
+    return (int)v;
+}
+
 int ai_loop_run(agent_t *agent, const char *task) {
     return ai_loop_run_internal(agent, task, 0, NULL, 0);
 }
