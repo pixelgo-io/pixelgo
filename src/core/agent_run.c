@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <time.h>
 #include <sys/wait.h>
@@ -136,11 +137,18 @@ static void signal_group(pid_t pid, int sig) {
 /* Waits non-blockingly for termination; returns:
     1  = it finished (status placed in *wstatus)
     0  = still running
-   -1  = error */
+   -1  = error
+   -2  = the child is gone but somebody else reaped it (ECHILD)
+
+ The ECHILD case is kept separate on purpose. It does NOT mean the agent
+ failed - it means its exit status was consumed elsewhere, so we simply do not
+ know how it ended. Treating that as failure is what made a stolen status look
+ identical to a crash, and stopped graphs on nodes that had succeeded. */
 static int try_reap(pid_t pid, int *wstatus) {
     pid_t r = waitpid(pid, wstatus, WNOHANG);
     if (r == pid) return 1;
     if (r == 0)   return 0;
+    if (errno == ECHILD) return -2;
     return -1;
 }
 
@@ -166,6 +174,48 @@ static void reclaim_terminal(void) {
     signal(SIGTTOU, old);
 }
 
+/*
+ * When an exit status has been consumed by someone else, we cannot ask the
+ * kernel how the agent ended - but the agent left evidence on disk. An AI agent
+ * writes _output.txt only after producing a final response, so a non-empty file
+ * means it got there. A worker leaves nothing, and for those we have no
+ * evidence either way.
+ *
+ * This is a fallback for a case that should no longer happen now that the HTTP
+ * server only reaps its own children. It exists because guessing "success" or
+ * guessing "failure" are both wrong, and evidence beats either guess.
+ */
+static int agent_produced_output(const agent_t *agent) {
+    char path[MAX_PATH_LEN + 16];
+    snprintf(path, sizeof(path), "%s/_output.txt", agent->dir);
+
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return st.st_size > 0;
+}
+
+/* Applies the "status was stolen" outcome: judge by evidence, and say plainly
+   in the log that this is inference rather than a reported status. */
+static int settle_unknown_status(agent_t *agent) {
+    int produced = agent_produced_output(agent);
+
+    if (agent->type == AGENT_TYPE_AI && produced) {
+        LOG_W("agent_wait: '%s' was reaped elsewhere; it left a final output, "
+              "treating it as finished", agent->id);
+        agent->exit_code = 0;
+        agent->status = AGENT_STOPPED;
+    } else {
+        LOG_W("agent_wait: '%s' was reaped elsewhere and left no output, "
+              "treating it as failed", agent->id);
+        agent->exit_code = -1;
+        agent->status = AGENT_FAILED;
+    }
+
+    agent->pid = 0;
+    reclaim_terminal();
+    return agent->status == AGENT_STOPPED ? 0 : -1;
+}
+
 int agent_wait(agent_t *agent) {
     if (agent->pid <= 0) return -1;
 
@@ -175,6 +225,7 @@ int agent_wait(agent_t *agent) {
         /* no timeout: simple blocking wait */
         int status;
         if (waitpid(agent->pid, &status, 0) < 0) {
+            if (errno == ECHILD) return settle_unknown_status(agent);
             LOG_E("agent_wait: waitpid failed: %s", strerror(errno));
             agent->status = AGENT_FAILED;
             agent->pid = 0;
@@ -206,6 +257,7 @@ int agent_wait(agent_t *agent) {
             agent->pid = 0;
             return ok ? 0 : -1;
         }
+        if (r == -2) return settle_unknown_status(agent);   /* see try_reap */
         if (r < 0) {
             LOG_E("agent_wait: waitpid failed: %s", strerror(errno));
             agent->status = AGENT_FAILED;
