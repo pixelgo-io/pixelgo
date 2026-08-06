@@ -207,15 +207,52 @@ static void send_response(int fd, const http_res_t *res) {
 /* --- the server loop --- */
 
 /*
- * Child reaper: the server forks for each request (concurrency) and for each
- * agent job. Without this, the finished processes would remain zombies and fill
- * up the process table.
- * waitpid(-1, WNOHANG) in a loop: reaps ALL finished children, without blocking.
+ * Child reaper.
+ *
+ * The server forks for each request, and those processes must not be left as
+ * zombies. But the reaper must collect ONLY those: a job's orchestrator runs in
+ * a descendant of this process and does its own waitpid() on the agents it
+ * started.
+ *
+ * The bug this guards against: reaping with waitpid(-1, NULL, ...) matches
+ * EVERY child, so whenever the handler fired first it consumed an agent's exit
+ * status and threw it away. The orchestrator's waitpid then failed with ECHILD,
+ * agent_wait read that as AGENT_FAILED, and the graph stopped on a node that
+ * had actually succeeded - while the agent process carried on writing files.
+ * Short tool calls almost never lost the race; a multi-minute `docker compose
+ * build` lost it every time.
+ *
+ * So we track the pids we fork and reap them individually. The table is fixed
+ * and touched from a signal handler, so everything here stays
+ * async-signal-safe: no allocation, no stdio, only sig_atomic_t slots.
  */
+#define MAX_TRACKED_CHILDREN 256
+
+static volatile sig_atomic_t g_child_pids[MAX_TRACKED_CHILDREN];
+
+static void track_child(pid_t pid) {
+    for (int i = 0; i < MAX_TRACKED_CHILDREN; i++) {
+        if (g_child_pids[i] == 0) { g_child_pids[i] = (sig_atomic_t)pid; return; }
+    }
+    /*
+     * The table is full: reap this one synchronously rather than leaking a
+     * zombie. Blocking here is acceptable because it only happens under a flood
+     * of concurrent requests, and only for one of them.
+     */
+    LOG_W("http: child table full, reaping pid %d synchronously", (int)pid);
+    waitpid(pid, NULL, 0);
+}
+
 static void reap_children(int sig) {
     (void)sig;
     int saved_errno = errno;   /* the handler must not clobber errno */
-    while (waitpid(-1, NULL, WNOHANG) > 0) { }
+
+    for (int i = 0; i < MAX_TRACKED_CHILDREN; i++) {
+        pid_t pid = (pid_t)g_child_pids[i];
+        if (pid == 0) continue;
+        if (waitpid(pid, NULL, WNOHANG) == pid) g_child_pids[i] = 0;
+    }
+
     errno = saved_errno;
 }
 
@@ -330,6 +367,8 @@ int http_serve(int port, http_handler_fn handler) {
 
         if (pid < 0)
             LOG_W("http: fork failed, the request is ignored: %s", strerror(errno));
+        else
+            track_child(pid);   /* so the reaper knows this one is ours */
 
         /* --- parent: closes the client socket and waits for the next one --- */
         close(fd);
