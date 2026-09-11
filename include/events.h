@@ -125,6 +125,49 @@ int  approval_wait(const char *node, const char *tool, const char *input);
 int  approval_channel_available(void);
 
 /*
+ * Editable approval: like approval_wait, but for a SINGLE large piece of
+ * text (e.g. a huge file dump about to be sent as part of a request) that
+ * the human can trim before allowing it through, instead of only
+ * accepting/denying the request as-is.
+ *
+ * `current_text` is offered for editing. It is NOT put in the events
+ * journal (journal lines are meant to be small; see the streaming/event
+ * route notes elsewhere) - it is written to a side file next to the
+ * journal, which the browser fetches separately when it opens the dialog.
+ *
+ * There are three outcomes, not two, because of a size mismatch: the
+ * SOURCE text has no size limit (it is served as a plain file read, however
+ * large), but any EDITED text coming back is bounded by HTTP_MAX_BODY (see
+ * http_server.h) - the human can always SEE a multi-megabyte block, but
+ * cannot always re-upload it whole through the same 64KB-capped POST that
+ * carries a genuine edit. "Approve unchanged" exists so that case has an
+ * answer: it tells the agent to keep using current_text exactly as it
+ * already had it, without the browser ever needing to send it back.
+ *
+ *   1 + *out_edited = 1  -> allowed, out_text holds the human's edited text.
+ *   1 + *out_edited = 0  -> allowed, unchanged: out_text is NOT written;
+ *                           the caller must keep using its own current_text.
+ *   0                    -> denied or timed out (same 5-minute fail-closed
+ *                           timeout as approval_wait); out_text untouched.
+ *
+ * out_edited may be NULL if the caller does not care (equivalent to always
+ * treating a 0 return as "unchanged", which is only safe if the caller
+ * never intends to send the edited-text case - ai_loop.c always passes it).
+ *
+ * out_text_cap bounds how much edited text can come back - the HTTP layer
+ * itself caps request bodies (see HTTP_MAX_BODY in http_server.h), so this
+ * is not a new restriction, just documented here too.
+ */
+int  data_edit_wait(const char *node, const char *tool,
+                    const char *current_text,
+                    char *out_text, size_t out_text_cap,
+                    int *out_edited);
+
+/* True when this process can offer the editable-approval channel (i.e. it
+   was started as a web job). Mirrors approval_channel_available(). */
+int  data_edit_channel_available(void);
+
+/*
  * IMPORTANT: ai_loop runs in the AGENT's process (a grandchild of the server),
  * which does not have the journal open. The server passes it the path through
  * the PIXELGO_EVENTS_FILE environment variable, and events_open_from_env()

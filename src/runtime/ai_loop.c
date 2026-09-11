@@ -7,6 +7,9 @@
 #include "usage.h"
 #include "events.h"
 #include "log.h"
+#include "data_request_audit.h"
+#include "http_server.h"   /* for HTTP_MAX_BODY_CEILING - see the edited_text
+                               buffer sizing in the data-approval gateway below */
 #include <unistd.h>
 #include <signal.h>
 #include <termios.h>
@@ -401,6 +404,168 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
               provider_to_string(agent->cfg.ai.provider), agent->cfg.ai.model);
 
         event_agent_thinking(agent->id, iter + 1);
+
+        /*
+         * Data Request Approval Gateway.
+         *
+         * Before the request goes out, check its size against the agent's
+         * configured threshold (0 = feature disabled, the default).
+         *
+         * Shows the human the ACTUAL request about to go out - system
+         * prompt, model, the full `messages` history (every turn, every
+         * tool result, up to and including whatever just pushed this over
+         * threshold), and any tool schemas - as real, pretty-printed JSON.
+         * This is pixelgo's own internal ("neutral") request shape, not a
+         * summary or a single block picked out of context: for Anthropic
+         * agents it IS the exact body that gets sent (the neutral format
+         * was deliberately chosen to match Anthropic's Messages API almost
+         * field-for-field - see providers/anthropic.c). For OpenAI/Gemini
+         * agents, the adapter translates this same content into that
+         * provider's own wire shape (different field names, different
+         * tool-call encoding) immediately before sending - what's shown
+         * here is the same conversation, not yet translated, so the human
+         * can review and trim it in one common format regardless of which
+         * provider the agent uses.
+         *
+         * On "Send trimmed", the edited JSON is parsed back and its
+         * "messages" array WHOLESALE REPLACES the live `messages` array -
+         * not a single field patched in place. This is deliberate: the
+         * whole point of showing the full conversation is letting the
+         * human delete entire turns they don't want sent (an old tool
+         * result that turned out to be noise, a redundant exchange), not
+         * just trim text within one block. If the edited text fails to
+         * parse as JSON, or has no "messages" array, the request is DENIED
+         * outright rather than guessing what the human meant or silently
+         * falling back to the untouched original - a request this
+         * malformed cannot safely be sent to the provider either way, so
+         * failing closed here costs nothing.
+         *
+         * The edit channel (data_edit_wait) needs a web job; when it is not
+         * available (CLI, or a non-interactive job) this falls back to the
+         * plain approve/deny channel already used for tool calls
+         * (ask_approval) - same summary, no editing, but never silently
+         * skips the check.
+         *
+         * approve_data_threshold_bytes is THREE-state (see agent.h): -1
+         * means this agent didn't set one, so it inherits
+         * PIXELGO_DATA_THRESHOLD (the global default) here, at the point of
+         * the check - not cached at startup, same convention as the other
+         * PIXELGO_* runtime knobs. 0 means explicitly off, which must WIN
+         * over the global default (an agent that opted out stays opted
+         * out), not fall through to it.
+         */
+        long effective_threshold = (agent->cfg.ai.approve_data_threshold_bytes >= 0)
+            ? agent->cfg.ai.approve_data_threshold_bytes
+            : data_threshold_global();
+
+        if (effective_threshold > 0) {
+            char *msg_json = cJSON_PrintUnformatted(messages);
+            size_t payload_bytes = strlen(agent->cfg.ai.system_prompt) +
+                                    (msg_json ? strlen(msg_json) : 0);
+            if (msg_json) free(msg_json);
+
+            if (payload_bytes > (size_t)effective_threshold) {
+                long tokens_est = data_audit_estimate_tokens(payload_bytes);
+                long cost_micro = usage_cost_micro(agent->cfg.ai.provider,
+                                                   agent->cfg.ai.model,
+                                                   tokens_est, 0);
+
+                char summary[256];
+                data_audit_build_summary(agent->cfg.ai.provider, agent->cfg.ai.model,
+                                         payload_bytes, tokens_est, cost_micro,
+                                         summary, sizeof(summary));
+
+                LOG_I("ai_loop: agent=%s data request needs approval: %s",
+                      agent->id, summary);
+
+                /* Build the real request preview: same shape as the actual
+                   Anthropic body (providers/anthropic.c), pretty-printed so
+                   a human can read it, not the compact form used for
+                   payload_bytes above. */
+                cJSON *preview = cJSON_CreateObject();
+                cJSON_AddStringToObject(preview, "model", agent->cfg.ai.model);
+                if (agent->cfg.ai.system_prompt[0])
+                    cJSON_AddStringToObject(preview, "system", agent->cfg.ai.system_prompt);
+                cJSON_AddItemToObject(preview, "messages", cJSON_Duplicate(messages, 1));
+                if (tools && cJSON_GetArraySize(tools) > 0)
+                    cJSON_AddItemToObject(preview, "tools", cJSON_Duplicate(tools, 1));
+
+                char *preview_text = cJSON_Print(preview);   /* pretty-printed, not compact */
+                cJSON_Delete(preview);
+
+                int allowed;
+                int edited = 0;
+                /* Sized to the HARD ceiling (not whatever PIXELGO_HTTP_MAX_BODY
+                   is currently set to), so a runtime env change can never
+                   make this smaller than what the network layer could
+                   actually deliver - static, so it costs nothing on the
+                   stack (see http_server.c's read_request for the same
+                   reasoning applied to the HTTP layer itself). */
+                static char edited_text[HTTP_MAX_BODY_CEILING + 1];
+                edited_text[0] = 0;
+
+                if (preview_text && data_edit_channel_available()) {
+                    allowed = data_edit_wait(agent->id, "send request to AI",
+                                             preview_text,
+                                             edited_text, sizeof(edited_text),
+                                             &edited);
+                } else {
+                    /* No editable channel (CLI, or preview build failed):
+                       fall back to the plain approve/deny already used for
+                       tools. */
+                    allowed = ask_approval(agent->id, "send request to AI", summary);
+                }
+                if (preview_text) cJSON_free(preview_text);
+
+                if (allowed && edited) {
+                    /* Parse the edited JSON back and replace the live
+                       `messages` array's CONTENTS in place (not the
+                       pointer itself - it's the same array object
+                       history_save() writes out at the end of the run, and
+                       ai_loop keeps iterating on it). A human deleting a
+                       whole turn from the JSON simply means that message
+                       object is absent from the parsed array - nothing
+                       special needed to "delete" it here, it's just not
+                       re-added below. */
+                    cJSON *edited_root = cJSON_Parse(edited_text);
+                    cJSON *edited_messages = edited_root
+                        ? cJSON_DetachItemFromObjectCaseSensitive(edited_root, "messages")
+                        : NULL;
+
+                    if (!cJSON_IsArray(edited_messages)) {
+                        LOG_W("ai_loop: agent=%s edited request is not valid JSON "
+                              "with a \"messages\" array - denying rather than "
+                              "sending something malformed or silently ignoring "
+                              "the edit", agent->id);
+                        allowed = 0;
+                    } else {
+                        while (cJSON_GetArraySize(messages) > 0)
+                            cJSON_DeleteItemFromArray(messages, 0);
+                        cJSON *item = edited_messages->child;
+                        while (item) {
+                            cJSON *next = item->next;
+                            cJSON_DetachItemViaPointer(edited_messages, item);
+                            cJSON_AddItemToArray(messages, item);
+                            item = next;
+                        }
+                    }
+                    if (edited_messages) cJSON_Delete(edited_messages);  /* now empty either way */
+                    if (edited_root) cJSON_Delete(edited_root);
+                }
+                /* allowed && !edited: "approve unchanged" - messages already
+                   holds the right content, nothing to do. */
+
+                data_audit_log_decision(NULL, agent->id, payload_bytes,
+                                        tokens_est, cost_micro,
+                                        allowed ? "approved" : "denied");
+
+                if (!allowed) {
+                    LOG_W("ai_loop: agent=%s data request denied, stopping",
+                          agent->id);
+                    break;
+                }
+            }
+        }
 
         /* The call goes through the provider layer: ai_loop does not know whether
            Anthropic, OpenAI or Gemini is underneath. The response arrives already

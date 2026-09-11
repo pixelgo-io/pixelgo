@@ -193,6 +193,120 @@ undo your configuration. And if nobody can be asked (no terminal, no browser
 attached), the answer is **no**: an agent set up to need approval never acts
 unsupervised just because nobody was watching.
 
+## Guarding against oversized requests
+
+`--approve` gates *what an agent does*. `--data-threshold` gates *what it
+sends to the provider* — useful when a tool result (a big file `read_file`
+pulled in, a large `run_command` output) could otherwise balloon the next
+request's size and cost without you noticing until the bill arrives:
+
+```bash
+./pixelgo agent add ai demo coder anthropic claude-sonnet-5 \
+  "You are a C programmer." \
+  "read_file,write_file" "" \
+  --data-threshold 500KB
+```
+
+Accepts a size (`500KB`, `2MB`, a raw byte count) or the literal `off` to
+explicitly disable it for one agent. With **no flag at all**, the agent
+inherits `PIXELGO_DATA_THRESHOLD` if it's set — handy with several agents
+(`coordinator`, `reviewer`, `coder`, ...), so you set one default instead of
+repeating the flag on every `agent add`:
+
+```bash
+export PIXELGO_DATA_THRESHOLD=500KB   # applies to every agent below that
+                                       # doesn't set its own --data-threshold
+
+./pixelgo agent add ai demo coordinator anthropic claude-sonnet-5 "..." ""
+./pixelgo agent add ai demo reviewer   anthropic claude-sonnet-5 "..." ""
+./pixelgo agent add ai demo coder      anthropic claude-sonnet-5 "..." "" \
+  --data-threshold off          # this one's exempt, even with the global set
+```
+
+An explicit `--data-threshold` (a size, or `off`) always wins over the
+global default for that agent — only agents with no flag at all inherit it.
+
+Now, before any request whose total size (system prompt + full
+conversation so far) crosses the threshold goes out, the agent stops and
+asks — showing the **actual request**, not a summary: model, system
+prompt, and every message so far (every turn, every tool result), as
+real, pretty-printed JSON.
+
+In the web interface this opens a dedicated dialog: the full request,
+editable, with a live byte counter against the server's actual configured
+limit (see `PIXELGO_HTTP_MAX_BODY` below), and three options:
+
+```
+┌─ Large request needs your review ──────────────────
+│ coder is about to send this to the AI provider. This
+│ is the real request - edit or delete any part of it
+│ (whole turns included), then Send, or approve it
+│ unchanged, or Cancel to stop the agent.
+│
+│ ┌────────────────────────────────────────────────┐
+│ │ {                                                │
+│ │   "model": "claude-sonnet-5",                    │
+│ │   "system": "You are a C programmer.",           │
+│ │   "messages": [                                  │
+│ │     { "role": "user", "content": [...] },        │
+│ │     { "role": "assistant", "content": [...] },   │
+│ │     ...                                          │
+│ │   ]                                               │
+│ │ }                                                 │
+│ └────────────────────────────────────────────────┘
+│  184,204 / 2,097,152 bytes
+│              [Cancel]  [Approve as-is]  [Send trimmed]
+└──────────────────────────────────────────────────────
+```
+
+This is pixelgo's own internal ("neutral") request shape — for Anthropic
+agents it's the exact body that gets sent (the internal format was
+deliberately chosen to match Anthropic's Messages API almost
+field-for-field). For OpenAI/Gemini agents, the same content gets
+translated into that provider's own wire format immediately after this
+step (different field names, different tool-call encoding) — what's shown
+here is the same conversation, not yet translated, so review works the
+same way regardless of which provider the agent uses.
+
+**Send trimmed** parses the edited JSON and replaces the conversation's
+`messages` array wholesale with whatever is in it — delete an entire turn
+you don't want sent (an old tool result that turned out to be noise, a
+redundant exchange) and it's simply gone, not just its text emptied out.
+If the edited JSON doesn't parse, or has no `messages` array, the request
+is **denied** — a malformed edit is never silently sent as-is nor silently
+ignored in favor of the original. **Approve as-is** sends the request
+exactly as shown, without re-uploading it: this matters because the full
+request can be larger than what a single POST can carry (see below), so
+it's the only way to approve something too big to round-trip through the
+edit box. **Cancel** stops the agent, same as denying a tool call.
+
+On the CLI (or in a non-interactive job with no browser attached), this
+falls back to the same plain approve/deny prompt used for tools — no
+editing, but the check is never silently skipped.
+
+Every decision — approved or denied, edited or not — is logged to
+`~/.local/share/pixelgo/data_audit.log` with an estimated token count and
+cost, using the same pricing table `pixelgo costs` reports from.
+
+### `PIXELGO_HTTP_MAX_BODY`
+
+The web dialog's edit box can only send back up to a fixed number of
+bytes — 64KB by default, the same limit every POST route in the web API is
+already subject to. Raise it if you regularly review blocks bigger than
+that and want to trim them in the browser instead of relying on "Approve
+as-is":
+
+```bash
+PIXELGO_HTTP_MAX_BODY=2MB ./pixelgo serve 8080
+```
+
+Accepts the same formats as `PIXELGO_DATA_THRESHOLD`/`--data-threshold` —
+a size with a `KB`/`MB`/`GB` suffix, or a raw byte count (`2097152` works
+identically to `2MB`) — clamped between 64KB and a 4MB ceiling, sized
+around the largest context window current model providers accept (~1M
+tokens); a request bigger than that couldn't reach the model anyway,
+however this server is configured.
+
 ## Tests
 
 ```bash

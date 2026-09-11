@@ -1,5 +1,9 @@
 #include "http_server.h"
 #include "log.h"
+#include "data_request_audit.h"   /* for the shared data_threshold_parse() -
+                                     see http_max_body() below: KB/MB/GB/off
+                                     parsing lives there once, not duplicated
+                                     here as a second strtol()-only parser */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,17 +129,86 @@ static int parse_request(const char *raw, size_t raw_len, http_req_t *req,
     return 1;
 }
 
+/*
+ * PIXELGO_HTTP_MAX_BODY, read fresh each call (see the doc comment in
+ * http_server.h for why this is not cached at startup).
+ *
+ * Accepts exactly what PIXELGO_DATA_THRESHOLD and --data-threshold accept -
+ * a raw byte count, or a size with a KB/MB/GB suffix (case-insensitive,
+ * e.g. "2MB") - via the SAME shared parser (data_threshold_parse(), in
+ * data_request_audit.c). Before this, HTTP_MAX_BODY only took raw bytes
+ * ("2097152") while the data-threshold settings took friendly sizes
+ * ("2MB") - same unit (bytes), same project, two different formats for no
+ * real reason. One parser now backs all three.
+ *
+ * "off" is also accepted by that parser (it means 0 bytes), but 0 is not a
+ * meaningful body-size cap - the server always needs SOME buffer. Rather
+ * than special-casing "off" as an error here, it is simplest to let it
+ * fall straight into the "too small" clamp below: 0 bytes is obviously
+ * below HTTP_MAX_BODY_DEFAULT, so it gets raised to the default exactly
+ * like any other too-small value would, with the same warning explaining
+ * why.
+ *
+ * A malformed or out-of-range value falls back to the default rather than
+ * failing the request - a misconfigured limit should degrade to "the old
+ * behavior", not take the server down.
+ */
+size_t http_max_body(void) {
+    const char *env = getenv("PIXELGO_HTTP_MAX_BODY");
+    if (!env || !env[0]) return HTTP_MAX_BODY_DEFAULT;
+
+    long v = 0;
+    if (!data_threshold_parse(env, &v)) {
+        LOG_W("PIXELGO_HTTP_MAX_BODY='%s' could not be parsed (expected e.g. "
+              "\"2097152\", \"2MB\", or \"500KB\"), using the %d-byte default",
+              env, HTTP_MAX_BODY_DEFAULT);
+        return HTTP_MAX_BODY_DEFAULT;
+    }
+    if ((size_t)v > HTTP_MAX_BODY_CEILING) {
+        LOG_W("PIXELGO_HTTP_MAX_BODY='%s' (%ld bytes) exceeds the %d-byte "
+              "ceiling (around the largest context window current model "
+              "providers accept) - clamping to it", env, v, HTTP_MAX_BODY_CEILING);
+        return HTTP_MAX_BODY_CEILING;
+    }
+    if ((size_t)v < HTTP_MAX_BODY_DEFAULT) {
+        /* Letting it go lower than the original fixed limit would silently
+           reject requests every other route here already relies on being
+           able to send (workspace/agent configs, etc.) - raise-only. This
+           is also where "off" (parsed as 0 bytes, see the comment above)
+           lands, with the same message as any other too-small value. */
+        LOG_W("PIXELGO_HTTP_MAX_BODY='%s' (%ld bytes) is below the %d-byte "
+              "default - using the default instead", env, v, HTTP_MAX_BODY_DEFAULT);
+        return HTTP_MAX_BODY_DEFAULT;
+    }
+    return (size_t)v;
+}
+
 /* Reads a complete request from the socket (header + body). Returns 1 on success. */
 static int read_request(int fd, http_req_t *req) {
-    static char buf[HTTP_MAX_BODY + 8192];
+    /*
+     * Sized to the hard CEILING, once, as STATIC (not stack) memory - large
+     * but harmless, since static/BSS storage does not compete with a
+     * process's stack the way a local variable of the same size would.
+     * req->body below points straight into this buffer instead of being
+     * copied into a separately allocated one: one less allocation, and
+     * nothing to free afterward (each forked child handles exactly one
+     * request and exits - see http_serve - so there is no reuse to worry
+     * about between requests).
+     */
+    static char buf[HTTP_MAX_BODY_CEILING + 8192];
+
+    size_t max_body = http_max_body();
+    size_t buf_limit = max_body + 8192;   /* header allowance, same as before */
+    if (buf_limit > sizeof(buf)) buf_limit = sizeof(buf);   /* defensive */
+
     size_t total = 0;
     size_t header_len = 0, content_length = 0;
     int have_header = 0;
 
     for (;;) {
-        if (total >= sizeof(buf) - 1) break;   /* too large */
+        if (total >= buf_limit - 1) break;   /* too large */
 
-        ssize_t n = recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
+        ssize_t n = recv(fd, buf + total, buf_limit - 1 - total, 0);
         if (n <= 0) return 0;                  /* client closed / error */
         total += (size_t)n;
         buf[total] = 0;
@@ -153,13 +226,16 @@ static int read_request(int fd, http_req_t *req) {
 
     if (!have_header) return 0;
 
+    req->body = buf + header_len;   /* alias into the static buffer, no copy */
     if (content_length > 0) {
-        if (content_length > HTTP_MAX_BODY) content_length = HTTP_MAX_BODY;
+        if (content_length > max_body) content_length = max_body;
         size_t avail = total - header_len;
         size_t copy = content_length < avail ? content_length : avail;
-        memcpy(req->body, buf + header_len, copy);
         req->body[copy] = 0;
         req->body_len = copy;
+    } else {
+        req->body[0] = 0;
+        req->body_len = 0;
     }
     return 1;
 }

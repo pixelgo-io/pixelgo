@@ -72,6 +72,26 @@ typedef struct {
      */
     char approval_tools[MAX_TOOLS][MAX_STR];
     int  approval_count;
+
+    /* ===== DATA REQUEST APPROVAL GATEWAY (NEW) ===== */
+    /*
+     * approve_data_threshold_bytes: THREE states, not two -
+     *   -1  -> not specified for this agent; inherits PIXELGO_DATA_THRESHOLD
+     *          (the global default) at the point of the check. This is the
+     *          default when no --data-threshold flag is given at all.
+     *    0  -> explicitly disabled ("--data-threshold off"). Overrides the
+     *          global default - this agent is never checked, even if a
+     *          global default is set.
+     *   >0  -> an explicit threshold in bytes for this agent, overriding
+     *          the global default.
+     *
+     * The check runs before EVERY provider call for the rest of the run,
+     * not just the first one that crosses the threshold - there is no
+     * separate "per request" flag because that is already the only
+     * behavior this gateway has.
+     */
+    long approve_data_threshold_bytes;
+    /* ===== END DATA APPROVAL ===== */
 } ai_config_t;
 
 typedef struct {
