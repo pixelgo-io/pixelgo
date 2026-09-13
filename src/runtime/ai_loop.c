@@ -394,7 +394,7 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
 
     /* We accumulate usage over the whole loop (an agent can make several calls:
        tool_use -> result -> tool_use -> ... -> final response). */
-    usage_t total_usage = {0, 0, 0};
+    usage_t total_usage = {0};
 
     const int max_iterations = ai_loop_max_iterations();
 
@@ -684,9 +684,16 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
     {
         char cost[24];
         usage_format_cost(total_usage.cost_micro_usd, cost, sizeof(cost));
-        LOG_I("usage: agent=%s model=%s in=%ld out=%ld cost=%s",
-              agent->id, agent->cfg.ai.model,
-              total_usage.input_tokens, total_usage.output_tokens, cost);
+        if (total_usage.cache_write_tokens || total_usage.cache_read_tokens) {
+            LOG_I("usage: agent=%s model=%s in=%ld out=%ld cache_write=%ld cache_read=%ld cost=%s",
+                  agent->id, agent->cfg.ai.model,
+                  total_usage.input_tokens, total_usage.output_tokens,
+                  total_usage.cache_write_tokens, total_usage.cache_read_tokens, cost);
+        } else {
+            LOG_I("usage: agent=%s model=%s in=%ld out=%ld cost=%s",
+                  agent->id, agent->cfg.ai.model,
+                  total_usage.input_tokens, total_usage.output_tokens, cost);
+        }
 
         /* We persist to <agent_dir>/_usage.json, so the orchestrator and the web can
            sum usage across the whole graph. */
@@ -696,10 +703,13 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
         if (uf) {
             fprintf(uf,
                 "{\"agent\":\"%s\",\"provider\":\"%s\",\"model\":\"%s\","
-                "\"input_tokens\":%ld,\"output_tokens\":%ld,\"cost_micro_usd\":%ld}\n",
+                "\"input_tokens\":%ld,\"output_tokens\":%ld,"
+                "\"cache_write_tokens\":%ld,\"cache_read_tokens\":%ld,"
+                "\"cost_micro_usd\":%ld}\n",
                 agent->id, provider_to_string(agent->cfg.ai.provider),
                 agent->cfg.ai.model,
                 total_usage.input_tokens, total_usage.output_tokens,
+                total_usage.cache_write_tokens, total_usage.cache_read_tokens,
                 total_usage.cost_micro_usd);
             fclose(uf);
         }

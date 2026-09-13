@@ -125,6 +125,19 @@ int workspace_save(workspace_t *ws) {
                 fprintf(f, "%s%s", a->cfg.ai.run_command_allowlist[j], j + 1 < a->cfg.ai.allowlist_count ? "," : "");
             }
             fprintf(f, "\n");
+            /*
+             * Prompt caching - written only when an explicit --cache was
+             * given (UNSET means "no flag", left out entirely so a reload
+             * still inherits PIXELGO_CACHE_MODE at check time, same as a
+             * freshly created agent would - see agent.h and
+             * data_approve_threshold below for the identical three/four-state
+             * reasoning).
+             */
+            if (a->cfg.ai.cache_mode != CACHE_MODE_UNSET) {
+                fprintf(f, "cache=%s\n",
+                        a->cfg.ai.cache_mode == CACHE_MODE_ON  ? "on"  :
+                        a->cfg.ai.cache_mode == CACHE_MODE_OFF ? "off" : "auto");
+            }
             /* Written only when set, so configs of unsupervised agents stay clean. */
             if (a->cfg.ai.approval_count > 0) {
                 fprintf(f, "approval=");
@@ -337,6 +350,15 @@ int workspace_load(workspace_t *ws, const char *root_dir) {
                 current->cfg.ai.tool_count = split(val, ',', current->cfg.ai.tools, MAX_TOOLS);
             else if (strcmp(key, "allowlist") == 0)
                 current->cfg.ai.allowlist_count = split(val, ',', current->cfg.ai.run_command_allowlist, MAX_ALLOWLIST);
+            else if (strcmp(key, "cache") == 0) {
+                if (strcmp(val, "on") == 0)       current->cfg.ai.cache_mode = CACHE_MODE_ON;
+                else if (strcmp(val, "off") == 0) current->cfg.ai.cache_mode = CACHE_MODE_OFF;
+                else                              current->cfg.ai.cache_mode = CACHE_MODE_AUTO;
+                /* An unrecognized value (a hand-edited file, a future version's
+                   spelling) falls back to "auto" rather than aborting the load -
+                   consistent with how an unknown provider only warns, elsewhere
+                   in this function, instead of refusing the whole workspace. */
+            }
             else if (strcmp(key, "approval") == 0)
                 current->cfg.ai.approval_count = split(val, ',', current->cfg.ai.approval_tools, MAX_TOOLS);
             else if (strcmp(key, "data_approve_threshold") == 0) {

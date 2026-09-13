@@ -119,11 +119,15 @@ static int read_agent_usage(const agent_t *a, usage_t *out, char *model, size_t 
 
     cJSON *in   = cJSON_GetObjectItemCaseSensitive(o, "input_tokens");
     cJSON *out_ = cJSON_GetObjectItemCaseSensitive(o, "output_tokens");
+    cJSON *cw   = cJSON_GetObjectItemCaseSensitive(o, "cache_write_tokens");
+    cJSON *cr   = cJSON_GetObjectItemCaseSensitive(o, "cache_read_tokens");
     cJSON *cost = cJSON_GetObjectItemCaseSensitive(o, "cost_micro_usd");
 
-    out->input_tokens   = cJSON_IsNumber(in)   ? (long)in->valuedouble   : 0;
-    out->output_tokens  = cJSON_IsNumber(out_) ? (long)out_->valuedouble : 0;
-    out->cost_micro_usd = cJSON_IsNumber(cost) ? (long)cost->valuedouble : 0;
+    out->input_tokens       = cJSON_IsNumber(in)   ? (long)in->valuedouble   : 0;
+    out->output_tokens      = cJSON_IsNumber(out_) ? (long)out_->valuedouble : 0;
+    out->cache_write_tokens = cJSON_IsNumber(cw)   ? (long)cw->valuedouble   : 0;
+    out->cache_read_tokens  = cJSON_IsNumber(cr)   ? (long)cr->valuedouble   : 0;
+    out->cost_micro_usd     = cJSON_IsNumber(cost) ? (long)cost->valuedouble : 0;
 
     if (model && model_size) json_get_string(o, "model", model, model_size);
     if (provider) {
@@ -141,13 +145,20 @@ static int read_agent_usage(const agent_t *a, usage_t *out, char *model, size_t 
  * the WHOLE graph had run on the most expensive model used.
  */
 static void report_costs(workspace_t *ws, const flow_graph_t *g) {
-    usage_t total = {0, 0, 0};
+    usage_t total = {0};
     int have_any = 0;
 
     /* the most expensive model used in the graph - the reference for comparison */
     char most_expensive_model[MAX_STR] = "";
     llm_provider_id_t most_expensive_provider = LLM_PROVIDER_UNKNOWN;
     long highest_rate = 0;
+
+    /* What the SAME agents, on the SAME models, would have cost with caching
+       turned off entirely - i.e. every cache_write/cache_read token billed as
+       a plain input token instead. Accumulated per-agent (inside the loop
+       below) because the price-per-token differs by model, unlike the
+       aggregate `total` which can no longer be split back out by model. */
+    long total_cost_no_cache = 0;
 
     LOG_I("--- cost pe agent ---");
 
@@ -165,9 +176,20 @@ static void report_costs(workspace_t *ws, const flow_graph_t *g) {
 
         char cost[24];
         usage_format_cost(u.cost_micro_usd, cost, sizeof(cost));
-        LOG_I("  %-16s %-10s %-22s in=%-7ld out=%-6ld %s",
-              a->id, provider_to_string(prov), model,
-              u.input_tokens, u.output_tokens, cost);
+        if (u.cache_write_tokens || u.cache_read_tokens) {
+            LOG_I("  %-16s %-10s %-22s in=%-7ld out=%-6ld cache_w=%-6ld cache_r=%-6ld %s",
+                  a->id, provider_to_string(prov), model,
+                  u.input_tokens, u.output_tokens,
+                  u.cache_write_tokens, u.cache_read_tokens, cost);
+        } else {
+            LOG_I("  %-16s %-10s %-22s in=%-7ld out=%-6ld %s",
+                  a->id, provider_to_string(prov), model,
+                  u.input_tokens, u.output_tokens, cost);
+        }
+
+        total_cost_no_cache += usage_cost_micro(prov, model,
+            u.input_tokens + u.cache_write_tokens + u.cache_read_tokens,
+            u.output_tokens);
 
         /* we keep the model with the highest OUTPUT price (a proxy for "the expensive one") */
         long rate = usage_cost_micro(prov, model, 0, 1000000);   /* price per 1M output */
@@ -183,8 +205,27 @@ static void report_costs(workspace_t *ws, const flow_graph_t *g) {
     char total_cost[24];
     usage_format_cost(total.cost_micro_usd, total_cost, sizeof(total_cost));
 
-    LOG_I("--- total: in=%ld out=%ld cost=%s ---",
-          total.input_tokens, total.output_tokens, total_cost);
+    if (total.cache_write_tokens || total.cache_read_tokens) {
+        LOG_I("--- total: in=%ld out=%ld cache_write=%ld cache_read=%ld cost=%s ---",
+              total.input_tokens, total.output_tokens,
+              total.cache_write_tokens, total.cache_read_tokens, total_cost);
+    } else {
+        LOG_I("--- total: in=%ld out=%ld cost=%s ---",
+              total.input_tokens, total.output_tokens, total_cost);
+    }
+
+    /* The comparison that matters for caching specifically: same agents, same
+       models, cache off. Separate from the "cheap vs expensive model" savings
+       below - this isolates what caching itself bought, not the model choice. */
+    if (total_cost_no_cache > total.cost_micro_usd) {
+        char no_cache_cost[24], cache_saved[24];
+        usage_format_cost(total_cost_no_cache, no_cache_cost, sizeof(no_cache_cost));
+        usage_format_cost(total_cost_no_cache - total.cost_micro_usd, cache_saved, sizeof(cache_saved));
+        int cache_pct = (int)(100 - (total.cost_micro_usd * 100) / total_cost_no_cache);
+
+        LOG_I("--- without prompt caching: %s ---", no_cache_cost);
+        LOG_I("--- CACHE SAVINGS: %s (%d%%) ---", cache_saved, cache_pct);
+    }
 
     /* The comparison that matters: what would everything have cost on the expensive model? */
     if (most_expensive_model[0] && highest_rate > 0) {
@@ -268,7 +309,7 @@ int orchestrator_run(workspace_t *ws, const flow_graph_t *g, const char *initial
                 failed = 1;
             } else {
                 /* node finished successfully: we report the cost and duration */
-                usage_t u = {0, 0, 0};
+                usage_t u = {0};
                 read_agent_usage(running[i], &u, NULL, 0, NULL);
                 event_node_done(running[i]->id, u.input_tokens, u.output_tokens,
                                 u.cost_micro_usd, (long)(now_ms() - step_start));
@@ -384,11 +425,11 @@ int orchestrator_run(workspace_t *ws, const flow_graph_t *g, const char *initial
                 LOG_I("orch: no applicable transition, stopping (dead end)");
 
             /* the cost total, for the final event */
-            usage_t grand = {0, 0, 0};
+            usage_t grand = {0};
             for (int i = 0; i < g->node_count; i++) {
                 agent_t *a = workspace_find_agent(ws, g->nodes[i]);
                 if (!a) continue;
-                usage_t u = {0, 0, 0};
+                usage_t u = {0};
                 if (read_agent_usage(a, &u, NULL, 0, NULL)) usage_add(&grand, &u);
             }
             event_graph_done(grand.cost_micro_usd, (long)(now_ms() - graph_start));
