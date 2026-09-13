@@ -1,4 +1,5 @@
 #include "workspace.h"
+#include "data_request_audit.h"
 #include "agent_run.h"
 #include "flow.h"
 #include "orchestrator.h"
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -31,6 +33,10 @@ static void print_usage(void) {
         "                   tools:    read_file, write_file, list_dir, run_command, search_files\n"
         "                   last argument (optional): commands allowed for run_command, e.g. \"gcc,make\"\n"
         "                   --approve <tool1,tool2>: ask you before those tools run, e.g. \"write_file,run_command\"\n"
+        "                   --data-threshold <size>: ask you before a request over this size is sent to the\n"
+        "                                            provider, e.g. \"500KB\", \"2MB\", or \"off\" to explicitly\n"
+        "                                            disable it for this agent. Default: inherits\n"
+        "                                            PIXELGO_DATA_THRESHOLD if set, otherwise disabled.\n"
         "  agent run  <workspace> <agent_id> [task]        (single question)\n"
         "  agent chat <workspace> <agent_id> [--reset]    (conversation, remembers)\n"
         "  agent list <workspace>\n"
@@ -166,7 +172,8 @@ static int cmd_agent_add_ai(const char *ws_name, const char *agent_id,
                              const char *provider_str, const char *model,
                              const char *prompt, const char *tools_csv,
                              const char *allowlist_csv,
-                             const char *approval_csv) {
+                             const char *approval_csv,
+                             const char *data_threshold_str) {
     char ws_path[MAX_PATH_LEN];
     snprintf(ws_path, MAX_PATH_LEN, "%s/%s", BASE_DIR, ws_name);
 
@@ -231,6 +238,26 @@ static int cmd_agent_add_ai(const char *ws_name, const char *agent_id,
         }
     }
 
+    /*
+     * Data request approval threshold, e.g. "500KB", "2MB", or "off".
+     * -1 (not 0) is the "no flag given" default, so this agent inherits
+     * PIXELGO_DATA_THRESHOLD (the global default) at check time instead of
+     * being silently disabled - see agent.h for the full three-state
+     * semantics (-1 / 0 / >0).
+     */
+    agent.cfg.ai.approve_data_threshold_bytes = -1;
+    if (data_threshold_str && data_threshold_str[0]) {
+        long bytes = 0;
+        if (data_threshold_parse(data_threshold_str, &bytes)) {
+            agent.cfg.ai.approve_data_threshold_bytes = bytes;
+        } else {
+            fprintf(stderr,
+                    "Warning: could not parse --data-threshold '%s', ignoring - this "
+                    "agent will fall back to PIXELGO_DATA_THRESHOLD if set "
+                    "(expected e.g. \"500KB\", \"2MB\", or \"off\")\n", data_threshold_str);
+        }
+    }
+
     int has_run_command = 0;
     for (int i = 0; i < agent.cfg.ai.tool_count; i++)
         if (strcmp(agent.cfg.ai.tools[i], "run_command") == 0) has_run_command = 1;
@@ -248,6 +275,11 @@ static int cmd_agent_add_ai(const char *ws_name, const char *agent_id,
            agent_id, ws_name, agent.dir, tools_csv);
     if (agent.cfg.ai.approval_count > 0)
         printf("  requires your approval for: %s\n", approval_csv);
+    if (agent.cfg.ai.approve_data_threshold_bytes > 0)
+        printf("  requires your approval for requests over %ld bytes\n",
+               agent.cfg.ai.approve_data_threshold_bytes);
+    else if (agent.cfg.ai.approve_data_threshold_bytes == 0)
+        printf("  data-threshold: explicitly off (ignores PIXELGO_DATA_THRESHOLD if set)\n");
     return 0;
 }
 
@@ -504,19 +536,24 @@ int main(int argc, char **argv) {
             }
             if (strcmp(argv[3], "ai") == 0 && argc >= 10) {
                 /* Optional trailing args: the run_command allowlist (positional,
-                   kept for compatibility) and --approve <tools> which makes the
-                   agent ask before those tools run. */
+                   kept for compatibility), --approve <tools> which makes the
+                   agent ask before those tools run, and --data-threshold <size>
+                   which makes it ask before sending an oversized request to the
+                   provider (e.g. "500KB", "2MB"). */
                 const char *allow = NULL;
                 const char *approve = NULL;
+                const char *data_threshold = NULL;
                 for (int i = 10; i < argc; i++) {
                     if (strcmp(argv[i], "--approve") == 0 && i + 1 < argc) {
                         approve = argv[++i];
+                    } else if (strcmp(argv[i], "--data-threshold") == 0 && i + 1 < argc) {
+                        data_threshold = argv[++i];
                     } else if (!allow) {
                         allow = argv[i];
                     }
                 }
                 return cmd_agent_add_ai(argv[4], argv[5], argv[6], argv[7], argv[8],
-                                        argv[9], allow, approve);
+                                        argv[9], allow, approve, data_threshold);
             }
         }
         if (strcmp(argv[2], "run") == 0 && argc >= 5) {

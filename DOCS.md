@@ -16,14 +16,15 @@ graph declared in a DSL.
 6. [Examples](#examples)
 7. [CLI reference](#cli-reference)
 8. [Advanced configuration](#advanced-configuration)
-9. [Interactive chat](#interactive-chat-conversation-with-memory)
-10. [Visualizing the run](#visualizing-the-run-the-circulating-pixels)
-11. [Costs and tokens](#costs-and-tokens)
-12. [API keys (.env file)](#api-keys-env-file)
-13. [Web interface](#web-interface)
-14. [Multiple workspaces](#multiple-workspaces)
-15. [Simple chat agent](#simple-chat-agent-no-tools)
-16. [Internal architecture](#internal-architecture)
+9. [Data request approval gateway](#data-request-approval-gateway)
+10. [Interactive chat](#interactive-chat-conversation-with-memory)
+11. [Visualizing the run](#visualizing-the-run-the-circulating-pixels)
+12. [Costs and tokens](#costs-and-tokens)
+13. [API keys (.env file)](#api-keys-env-file)
+14. [Web interface](#web-interface)
+15. [Multiple workspaces](#multiple-workspaces)
+16. [Simple chat agent](#simple-chat-agent-no-tools)
+17. [Internal architecture](#internal-architecture)
 
 ---
 
@@ -601,6 +602,159 @@ stuck). An agent that fails otherwise can be restarted (AI agents: once).
 
 ---
 
+## Data request approval gateway
+
+`--approve` (see the README) gates *what an agent does* — a tool call.
+`--data-threshold` gates *what it sends to the provider* — the size of the
+next request, checked before it goes out.
+
+### Why this exists
+
+An agent's context grows every iteration: the system prompt, the full
+conversation so far, every tool result. A single `read_file` on a large log
+or a verbose `run_command` output can push the next request's size — and
+its cost — up sharply, with nothing stopping it before the bill arrives.
+`--data-threshold` is that stop.
+
+### Configuring it
+
+```bash
+./pixelgo agent add ai demo coder anthropic claude-sonnet-5 \
+  "You are a programmer." \
+  "read_file,write_file" "" \
+  --data-threshold 500KB
+```
+
+Accepts a raw byte count, a size with a `KB`/`MB`/`GB` suffix
+(case-insensitive), or the literal `off`.
+
+**Three states, not two.** This matters once you have several agents:
+
+| What you pass | Meaning |
+|---|---|
+| no `--data-threshold` flag at all | inherits `PIXELGO_DATA_THRESHOLD` (see below) if set, otherwise disabled |
+| `--data-threshold 500KB` (or any size) | this agent's own threshold — overrides the global default, even if one is set |
+| `--data-threshold off` | explicitly disabled for this agent — overrides the global default too, so a global default set elsewhere never silently re-enables it |
+
+```bash
+export PIXELGO_DATA_THRESHOLD=500KB
+
+./pixelgo agent add ai demo reviewer anthropic claude-sonnet-5 "..." ""
+#   -> no flag: inherits the 500KB global default
+
+./pixelgo agent add ai demo coder anthropic claude-sonnet-5 "..." "" \
+  --data-threshold 2MB
+#   -> explicit: 2MB, ignores the 500KB global default
+
+./pixelgo agent add ai demo scratch anthropic claude-sonnet-5 "..." "" \
+  --data-threshold off
+#   -> explicitly off, ignores the 500KB global default
+```
+
+`PIXELGO_DATA_THRESHOLD` is read fresh from the environment at the point of
+each check (same convention as `PIXELGO_COMMAND_TIMEOUT`,
+`PIXELGO_MAX_ITERATIONS`, `PIXELGO_HTTP_MAX_BODY`) — not cached when the
+agent was created, so changing it takes effect on the next run without
+recreating any agent. It accepts the same spellings as `--data-threshold`
+(a size, or `off`); an unparseable value logs a warning and is treated as
+disabled.
+
+The per-agent choice persists in `workspace.conf` as three distinct forms,
+matching the three states above:
+
+```ini
+[agent]
+id=reviewer
+...
+# no data_approve_threshold line at all -> inherits the global default
+
+[agent]
+id=coder
+...
+data_approve_threshold=2097152        # explicit value, always stored as
+                                       # raw bytes regardless of what
+                                       # suffix was used on the command line
+
+[agent]
+id=scratch
+...
+data_approve_threshold=off            # explicitly disabled
+```
+
+The `off` form matters specifically because it's the only way to tell "not
+specified" and "specified as disabled" apart on reload — leaving the line
+out entirely, the way earlier versions of this feature handled disabling,
+would have made an explicit opt-out silently start inheriting the global
+default again after a restart.
+
+### What happens over threshold
+
+Before each call to the provider, `ai_loop` resolves the effective
+threshold (the agent's own, or the global default if it didn't set one),
+sums the current payload size (system prompt + the full `messages` history
+as it would actually be sent)
+and compares it to the threshold. If it's over:
+
+1. It builds a preview of the **actual request**: `model`, `system` (if
+   set), the full `messages` array exactly as it stands, and `tools` (if
+   any) — pretty-printed as real JSON. This is pixelgo's internal
+   ("neutral") request shape, not a summary or a single block picked out
+   of context. For Anthropic agents this preview IS the exact body that
+   gets sent (the neutral format is deliberately close to Anthropic's
+   Messages API - see `src/runtime/providers/anthropic.c`); for
+   OpenAI/Gemini agents the same content is translated into that
+   provider's own wire format (different field names, different tool-call
+   encoding) immediately after this step, so what's reviewed here is the
+   conversation before translation, not the literal bytes that provider's
+   API receives.
+2. If a web job is running, it opens the browser dialog described in the
+   README, with three outcomes: send the edited JSON (its `messages` array
+   wholesale replaces the live conversation - deleting a whole turn from
+   the JSON simply removes it, not just its text), approve the request
+   unchanged without re-uploading it, or cancel (denies, stops the agent).
+   If the edited text fails to parse as JSON, or has no `messages` array,
+   the request is **denied outright** - never sent malformed, and the
+   edit is never silently discarded in favor of the stale original either.
+3. Otherwise (CLI run, or no web job attached), it falls back to the same
+   plain approve/deny prompt used for tool calls — the check still runs,
+   it just can't offer editing.
+4. Every decision is appended to `~/.local/share/pixelgo/data_audit.log`:
+
+   ```
+   1755612345 | ws=demo | agent=coder | payload=612000 bytes | tokens=~153000 | cost=$0.459000 | decision=approved
+   ```
+
+   The cost estimate uses the same pricing table `pixelgo costs` reports
+   from; the token estimate is a ~4-bytes-per-token rule of thumb, not the
+   provider's real tokenizer — good enough for a warning, not for billing
+   reconciliation.
+
+### The edit dialog's size limit
+
+The dialog's textarea can display a block of any size (the browser fetches
+it with no cap), but sending an *edited* version back is bounded by how
+large a request body the web server accepts — 64KB by default. A block
+larger than that can still be reviewed and approved (via "Approve as-is",
+which sends no text at all — the agent keeps using what it already had),
+but not edited down through the browser unless the cap is raised:
+
+```bash
+PIXELGO_HTTP_MAX_BODY=2MB ./pixelgo serve 8080
+```
+
+Accepts the same formats as `PIXELGO_DATA_THRESHOLD`/`--data-threshold` -
+a `KB`/`MB`/`GB` size or a raw byte count, via the same parser (there is no
+reason this one variable alone should demand raw bytes while the other two
+accept friendly sizes). Read from the environment on every request (not
+cached at startup), and clamped to `[64KB, 4MB]` — the upper bound is sized
+around the largest context window current model providers accept (~1M
+tokens; a request bigger than that couldn't reach the model regardless of
+what this server allows through). The server reports its actual configured
+value at `GET /api/limits`, which the dialog's byte counter and Send button
+read from directly, so they never work off a stale assumption.
+
+---
+
 ## Interactive chat (conversation with memory)
 
 Two ways to talk to an AI agent:
@@ -818,6 +972,13 @@ OPENAI_API_KEY="sk-..."          # the quotes are optional
 export GEMINI_API_KEY='AIza...'  # "export" is accepted too
 
 PIXELGO_LOG_LEVEL=info
+
+# Raises the cap on request bodies the web UI can send (default 64KB,
+# ceiling 4MB - see the "data-threshold" agent option). Only needed if
+# you configure a large --data-threshold and want to trim/approve big
+# blocks through the browser instead of via "Approve as-is". Accepts a
+# size like "2MB" or a raw byte count.
+# PIXELGO_HTTP_MAX_BODY=2MB
 ```
 
 Check what was loaded:

@@ -14,6 +14,7 @@ SRC = \
 	src/core/envfile.c \
 	src/core/usage.c \
 	src/core/selfhost.c \
+	src/core/data_request_audit.c \
 	src/tools/json_util.c \
 	src/tools/tools_common.c \
 	src/tools/file_tools.c \

@@ -1,8 +1,10 @@
 #include "workspace.h"
 #include "provider.h"
+#include "data_request_audit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <errno.h>
 
@@ -130,6 +132,27 @@ int workspace_save(workspace_t *ws) {
                     fprintf(f, "%s%s", a->cfg.ai.approval_tools[j], j + 1 < a->cfg.ai.approval_count ? "," : "");
                 }
                 fprintf(f, "\n");
+            }
+            /*
+             * Data request approval threshold - three states on disk, not
+             * just "write only when set":
+             *   -1 (not specified)  -> write nothing, so a reload inherits
+             *                          PIXELGO_DATA_THRESHOLD again, same as
+             *                          a freshly created agent would.
+             *    0 (explicitly off) -> write the literal "off", so a reload
+             *                          does NOT fall back to the global
+             *                          default - "off" must stay off.
+             *   >0 (explicit value) -> write the byte count.
+             * Leaving out the "off" case (writing nothing, like the old
+             * two-state version did) would be indistinguishable from
+             * "not specified" on the next load - exactly the ambiguity this
+             * three-state design exists to avoid.
+             */
+            if (a->cfg.ai.approve_data_threshold_bytes == 0) {
+                fprintf(f, "data_approve_threshold=off\n");
+            } else if (a->cfg.ai.approve_data_threshold_bytes > 0) {
+                fprintf(f, "data_approve_threshold=%ld\n",
+                        a->cfg.ai.approve_data_threshold_bytes);
             }
         }
 
@@ -273,6 +296,10 @@ int workspace_load(workspace_t *ws, const char *root_dir) {
             strcpy(section, "agent");
             current = &ws->agents[ws->agent_count++];
             memset(current, 0, sizeof(*current));
+            /* Not just zeroing: approve_data_threshold_bytes defaults to -1
+               ("not specified"), not 0 ("explicitly off") - see agent.h.
+               Overwritten below if a data_approve_threshold= line follows. */
+            current->cfg.ai.approve_data_threshold_bytes = -1;
             continue;
         }
 
@@ -312,6 +339,18 @@ int workspace_load(workspace_t *ws, const char *root_dir) {
                 current->cfg.ai.allowlist_count = split(val, ',', current->cfg.ai.run_command_allowlist, MAX_ALLOWLIST);
             else if (strcmp(key, "approval") == 0)
                 current->cfg.ai.approval_count = split(val, ',', current->cfg.ai.approval_tools, MAX_TOOLS);
+            else if (strcmp(key, "data_approve_threshold") == 0) {
+                /* "500KB", "2MB", raw bytes, or "off" - same parser used by
+                   the CLI flag and PIXELGO_DATA_THRESHOLD, so all three
+                   accept identical spellings. A value that fails to parse
+                   is ignored, leaving the -1 ("not specified") default from
+                   the [agent] reset above in place, rather than silently
+                   keeping whatever garbage was in the file. */
+                long bytes = 0;
+                if (data_threshold_parse(val, &bytes)) {
+                    current->cfg.ai.approve_data_threshold_bytes = bytes;
+                }
+            }
             else if (strcmp(key, "limit_cpu_seconds") == 0)
                 current->limits.cpu_seconds = strtol(val, NULL, 10);
             else if (strcmp(key, "limit_mem_bytes") == 0)

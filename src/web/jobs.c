@@ -402,6 +402,24 @@ int jobs_approval_path(const char *job_id, char *out, size_t out_size) {
     return 1;
 }
 
+int jobs_data_edit_path(const char *job_id, char *out, size_t out_size) {
+    if (!jobs_init()) return 0;
+    if (!job_id || !job_id[0]) return 0;
+    if (strchr(job_id, '/') || strstr(job_id, "..")) return 0;   /* safe id */
+
+    snprintf(out, out_size, "%s/%s.data_edit", g_jobs_dir, job_id);
+    return 1;
+}
+
+int jobs_data_edit_source_path(const char *job_id, char *out, size_t out_size) {
+    if (!jobs_init()) return 0;
+    if (!job_id || !job_id[0]) return 0;
+    if (strchr(job_id, '/') || strstr(job_id, "..")) return 0;   /* safe id */
+
+    snprintf(out, out_size, "%s/%s.data_edit_src", g_jobs_dir, job_id);
+    return 1;
+}
+
 int jobs_cleanup(int max_age_seconds) {
     if (!jobs_init()) return 0;
 

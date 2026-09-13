@@ -680,6 +680,136 @@ static void route_job_approve(const http_req_t *req, http_res_t *res) {
 }
 
 /*
+ * GET /api/jobs/<id>/data-edit-source
+ *
+ * Serves the original text a "data_edit_needed" event referred to, as plain
+ * text - not wrapped in JSON, and not copied through a fixed-size buffer
+ * like most routes here, because this text can be large (that is the whole
+ * point of the feature). http_res_static does not copy, so we read the
+ * file into a heap buffer sized to it and hand that buffer over.
+ */
+static void route_job_data_edit_source(const http_req_t *req, http_res_t *res) {
+    char id[JOB_ID_LEN];
+    const char *p = req->path + strlen("/api/jobs/");
+    const char *slash = strchr(p, '/');
+    if (!slash) { http_res_error(res, 400, "invalid path"); return; }
+
+    size_t len = (size_t)(slash - p);
+    if (len == 0 || len >= sizeof(id)) { http_res_error(res, 400, "invalid id"); return; }
+    memcpy(id, p, len);
+    id[len] = 0;
+
+    char path[1024];
+    if (!jobs_data_edit_source_path(id, path, sizeof(path))) {
+        http_res_error(res, 400, "invalid id"); return;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) { http_res_error(res, 404, "no pending data-edit request"); return; }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 0) { fclose(f); http_res_error(res, 500, "cannot read the source file"); return; }
+
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) { fclose(f); http_res_error(res, 500, "out of memory"); return; }
+
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = 0;
+
+    http_res_static(res, 200, "text/plain; charset=utf-8", buf, got);
+    /* http_res_static does not copy - it takes ownership of buf and frees it
+       once the response is sent (same contract used for WEB_INDEX_HTML,
+       except that one is static/never freed; a heap buffer here is fine
+       since http_res_static's documented contract is "does not copy", not
+       "never frees" - the response layer owns it after this call). */
+}
+
+/*
+ * POST /api/jobs/<id>/data-edit
+ *   {"allow": true, "text": "..."}   -> approve with edited/resent text
+ *   {"allow": true}                  -> approve UNCHANGED (no "text" key)
+ *   {"allow": false}                 -> deny
+ *
+ * The human's decision for an editable-approval request: same "write a
+ * verdict file, the agent polls it" pattern as route_job_approve, except
+ * the file also carries the (possibly edited) text when allowed. The
+ * request body itself is capped by http_max_body() (see http_server.h) -
+ * 64KB by default, raisable via PIXELGO_HTTP_MAX_BODY up to a 4MB ceiling -
+ * the same limit every other POST route here is already subject to, not a
+ * new restriction introduced for this route.
+ *
+ * The "unchanged" case (omitting "text" entirely) exists because the
+ * SOURCE text served by the sibling GET route has no such cap - a human can
+ * review a block larger than even the configured ceiling in the browser but
+ * cannot always re-upload it whole through this same capped body. Omitting
+ * "text" tells the agent to keep using what it already had, without the
+ * browser ever sending it back.
+ */
+static void route_job_data_edit_decision(const http_req_t *req, http_res_t *res) {
+    char id[JOB_ID_LEN];
+    const char *p = req->path + strlen("/api/jobs/");
+    const char *slash = strchr(p, '/');
+    if (!slash) { http_res_error(res, 400, "invalid path"); return; }
+
+    size_t len = (size_t)(slash - p);
+    if (len == 0 || len >= sizeof(id)) { http_res_error(res, 400, "invalid id"); return; }
+    memcpy(id, p, len);
+    id[len] = 0;
+
+    cJSON *body = cJSON_Parse(req->body);
+    if (!body) { http_res_error(res, 400, "invalid JSON body"); return; }
+    cJSON *allow = cJSON_GetObjectItemCaseSensitive(body, "allow");
+    int allowed = cJSON_IsTrue(allow);
+
+    /*
+     * Presence of "text" (not just truthiness) is what means "edited": the
+     * browser either omits it entirely for "approve unchanged" (used when
+     * the source is too large to round-trip through this same 64KB-capped
+     * body), or always includes it - even as an empty string - when the
+     * human genuinely means "replace with nothing". Checking for the key
+     * itself, not just a non-empty value, is what keeps those two apart.
+     */
+    int has_text = cJSON_HasObjectItem(body, "text");
+    cJSON *text = has_text ? cJSON_GetObjectItemCaseSensitive(body, "text") : NULL;
+    if (allowed && has_text && !cJSON_IsString(text)) {
+        cJSON_Delete(body);
+        http_res_error(res, 400, "'text' must be a string when present"); return;
+    }
+    const char *text_str = (allowed && has_text) ? text->valuestring : NULL;
+
+    char path[1024];
+    if (!jobs_data_edit_path(id, path, sizeof(path))) {
+        cJSON_Delete(body);
+        http_res_error(res, 400, "invalid id"); return;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        cJSON_Delete(body);
+        http_res_error(res, 500, "cannot record the decision"); return;
+    }
+    if (allowed) {
+        fputs("allow", f);
+        if (text_str) {
+            fputs("E", f);
+            fputs(text_str, f);
+        } else {
+            fputs("U", f);   /* approved unchanged: no text follows */
+        }
+    } else {
+        fputs("deny", f);
+    }
+    fclose(f);
+    cJSON_Delete(body);
+
+    LOG_I("data_edit: job %s -> %s", id, allowed ? "allowed" : "denied");
+    http_res_json(res, 200, allowed ? "{\"allowed\":true}" : "{\"allowed\":false}");
+}
+
+/*
  * A job's events: /api/jobs/<id>/events?from=N
  * The frontend polls and receives only the NEW events (from index N), so it does
  * not retransmit the whole journal on each request.
@@ -828,6 +958,21 @@ static void route_flow_graph(const http_req_t *req, http_res_t *res) {
 
 /* --- dispatcher --- */
 
+/*
+ * GET /api/limits
+ *
+ * Exposes runtime-configured server limits the frontend needs to reason
+ * about locally, instead of hard-coding values that could drift from
+ * reality (e.g. PIXELGO_HTTP_MAX_BODY can raise the request body cap - the
+ * data-edit dialog's byte counter needs the REAL number, not the original
+ * 64KB default, or it would disable "Send trimmed" too early).
+ */
+static void route_limits(http_res_t *res) {
+    char json[128];
+    snprintf(json, sizeof(json), "{\"http_max_body\":%zu}", http_max_body());
+    http_res_json(res, 200, json);
+}
+
 void web_handler(const http_req_t *req, http_res_t *res) {
     int is_get  = strcmp(req->method, "GET") == 0;
     int is_post = strcmp(req->method, "POST") == 0;
@@ -858,6 +1003,9 @@ void web_handler(const http_req_t *req, http_res_t *res) {
     if (is_get && strcmp(req->path, "/api/history") == 0) {
         route_history_get(req, res); return;
     }
+    if (is_get && strcmp(req->path, "/api/limits") == 0) {
+        route_limits(res); return;
+    }
     if (is_post && strcmp(req->path, "/api/history/reset") == 0) {
         route_history_reset(req, res); return;
     }
@@ -871,8 +1019,9 @@ void web_handler(const http_req_t *req, http_res_t *res) {
         route_flow_run(req, res); return;
     }
     if (is_get && strncmp(req->path, "/api/jobs/", 10) == 0) {
-        /* /api/jobs/<id>/events takes priority over /api/jobs/<id> */
+        /* More specific suffixes take priority over the bare /api/jobs/<id> */
         if (strstr(req->path, "/events")) { route_job_events(req, res); return; }
+        if (strstr(req->path, "/data-edit-source")) { route_job_data_edit_source(req, res); return; }
         route_job_get(req, res); return;
     }
     if (is_post && strcmp(req->path, "/api/flow/graph") == 0) {
@@ -880,6 +1029,12 @@ void web_handler(const http_req_t *req, http_res_t *res) {
     }
     if (is_post && strcmp(req->path, "/api/flows") == 0) {
         route_flow_save(req, res); return;
+    }
+    if (is_post && strncmp(req->path, "/api/jobs/", 10) == 0 &&
+        strstr(req->path, "/data-edit")) {
+        /* Checked before /approve below: "/data-edit" is a distinct,
+           longer suffix and must not be shadowed by a looser match. */
+        route_job_data_edit_decision(req, res); return;
     }
     if (is_post && strncmp(req->path, "/api/jobs/", 10) == 0 &&
         strstr(req->path, "/approve")) {

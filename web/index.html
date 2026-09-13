@@ -253,7 +253,37 @@
   .approval-box .row { display: flex; gap: 8px; justify-content: flex-end; }
   .approval-box button { padding: 8px 18px; }
   .btn-deny { background: var(--bg); border: 1px solid var(--border); color: var(--text); }
+  .btn-secondary { background: var(--bg); border: 1px solid var(--accent); color: var(--accent); }
   @keyframes sp { to { transform: rotate(360deg); } }
+
+  /* --- editable-approval dialog: same idea, but for a single oversized
+     piece of text the human can trim before it goes out --- */
+  #data-edit-overlay {
+    display: none; position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,.55);
+    align-items: center; justify-content: center;
+  }
+  #data-edit-overlay.show { display: flex; }
+  .data-edit-box {
+    background: var(--panel); border: 1px solid var(--accent);
+    border-radius: 10px; padding: 20px 22px; max-width: 900px; width: 92%;
+    box-shadow: 0 10px 40px rgba(0,0,0,.5);
+  }
+  .data-edit-box h3 { margin: 0 0 4px; font-size: 15px; color: var(--accent); }
+  .data-edit-box .meta { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  .data-edit-box textarea {
+    width: 100%; height: 60vh; min-height: 300px; resize: vertical;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px; font-family: var(--mono); font-size: 12px; color: var(--text);
+    box-sizing: border-box; white-space: pre; overflow-wrap: normal;
+  }
+  .data-edit-box .counter {
+    font-size: 11px; color: var(--muted); margin: 6px 0 14px; text-align: right;
+  }
+  .data-edit-box .counter.over { color: #e5484d; }
+  .data-edit-box .row { display: flex; gap: 8px; justify-content: flex-end; }
+  .data-edit-box button { padding: 8px 18px; }
+  .data-edit-box button:disabled { opacity: .5; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -481,6 +511,30 @@
     <div class="row">
       <button class="btn-deny" id="approval-deny">Deny</button>
       <button id="approval-allow">Allow</button>
+    </div>
+  </div>
+</div>
+
+<!-- Shown when the full request about to be sent (system prompt + entire
+     conversation so far) has grown past the agent's --data-threshold. This
+     is the ACTUAL request body, pretty-printed - not a summary, not one
+     block picked out of context. Delete whole turns you don't want sent,
+     edit any text, then Send; the edited JSON's "messages" array wholesale
+     replaces the conversation before it goes out. -->
+<div id="data-edit-overlay">
+  <div class="data-edit-box">
+    <h3>Large request needs your review</h3>
+    <div class="meta">
+      <span id="data-edit-agent"></span> is about to send this to the AI provider.
+      This is the real request - edit or delete any part of it (whole turns
+      included), then Send, or approve it unchanged, or Cancel to stop the agent.
+    </div>
+    <textarea id="data-edit-text" spellcheck="false"></textarea>
+    <div class="counter" id="data-edit-counter"></div>
+    <div class="row">
+      <button class="btn-deny" id="data-edit-cancel">Cancel</button>
+      <button class="btn-secondary" id="data-edit-approve-unchanged">Approve as-is</button>
+      <button id="data-edit-send">Send trimmed</button>
     </div>
   </div>
 </div>
@@ -971,6 +1025,18 @@ function applyEvent(ev) {
             ev.allowed ? `✓ you allowed ${ev.tool}` : `✗ you denied ${ev.tool}`);
   }
 
+  else if (ev.t === 'data_edit_needed') {
+    const kb = (ev.text_len / 1024).toFixed(1);
+    logLine('tool', ev.ms, ev.node, `⏸ waiting for your review: ${ev.tool} (${kb} KB)`);
+    showDataEdit(ev);
+  }
+
+  else if (ev.t === 'data_edit_done') {
+    hideDataEdit();
+    logLine(ev.allowed ? 'node' : 'res err', ev.ms, ev.node,
+            ev.allowed ? `✓ you sent it (possibly trimmed)` : `✗ you cancelled ${ev.tool}`);
+  }
+
   else if (ev.t === 'graph_start') {
     $('#log-box').innerHTML = '';
     $('#log-card').style.display = '';
@@ -1108,12 +1174,127 @@ async function sendApproval(allow) {
 $('#approval-allow').onclick = () => sendApproval(true);
 $('#approval-deny').onclick  = () => sendApproval(false);
 
+/* Same idea as approvalJobId, for the editable-approval dialog. */
+let dataEditJobId = null;
+
+/*
+ * The server's actual request-body cap, fetched once from GET /api/limits
+ * and cached - NOT hard-coded, because PIXELGO_HTTP_MAX_BODY lets whoever
+ * runs the server raise it (up to a 4MB ceiling) beyond the original 64KB
+ * default. A stale hard-coded value here would disable "Send trimmed" too
+ * early on a server actually configured to accept more. Falls back to the
+ * original 64KB default if the fetch fails, matching the server's own
+ * fallback when the env var is unset.
+ */
+let dataEditByteCap = 65536;
+let dataEditByteCapLoaded = false;
+
+async function loadDataEditByteCap() {
+  if (dataEditByteCapLoaded) return;
+  try {
+    const r = await fetch('/api/limits');
+    if (r.ok) {
+      const data = await r.json();
+      if (typeof data.http_max_body === 'number' && data.http_max_body > 0) {
+        dataEditByteCap = data.http_max_body;
+      }
+    }
+  } catch (e) {
+    /* Keep the 65536 fallback - same value the server itself defaults to
+       when PIXELGO_HTTP_MAX_BODY is unset, so this stays correct even if
+       /api/limits is unreachable for some reason. */
+  }
+  dataEditByteCapLoaded = true;
+}
+
+function utf8Length(s) {
+  return new TextEncoder().encode(s).length;
+}
+
+function updateDataEditCounter() {
+  const len = utf8Length($('#data-edit-text').value);
+  const counter = $('#data-edit-counter');
+  const over = len >= dataEditByteCap;
+  counter.textContent = over
+    ? `${len.toLocaleString()} / ${dataEditByteCap.toLocaleString()} bytes - too big to send trimmed, use "Approve as-is" instead`
+    : `${len.toLocaleString()} / ${dataEditByteCap.toLocaleString()} bytes`;
+  counter.classList.toggle('over', over);
+  /* Past the cap, the server truncates the JSON body mid-string and the
+     POST comes back as a clean 400 - safe, but confusing: the human thinks
+     they sent it. Disabling Send here avoids that dead end instead of
+     explaining it after the fact. */
+  const sendBtn = $('#data-edit-send');
+  sendBtn.disabled = over;
+  sendBtn.title = over ? `Over the ${dataEditByteCap.toLocaleString()}-byte limit - trim more before sending` : '';
+}
+
+async function showDataEdit(ev) {
+  $('#data-edit-agent').textContent = ev.node || 'an agent';
+  $('#data-edit-text').value = '(loading…)';
+  $('#data-edit-overlay').classList.add('show');
+
+  /* Fetched once and cached - doesn't block showing the source text below,
+     but must finish before updateDataEditCounter() at the end so the very
+     first counter reading (and the Send button's disabled state) already
+     reflects the real limit, not the fallback. */
+  const capPromise = loadDataEditByteCap();
+
+  /* Plain fetch, not api(): the source route serves text/plain, not JSON -
+     forcing it through api()'s r.json() would throw on a non-JSON body. */
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(dataEditJobId)}/data-edit-source`);
+    const text = await r.text();
+    $('#data-edit-text').value = r.ok ? text : '';
+    if (!r.ok) toast('Could not load the text to review', 'err');
+  } catch (e) {
+    $('#data-edit-text').value = '';
+    toast('Could not load the text to review: ' + e.message, 'err');
+  }
+  await capPromise;
+  updateDataEditCounter();
+}
+
+function hideDataEdit() {
+  $('#data-edit-overlay').classList.remove('show');
+}
+
+/*
+ * `withText`: true sends the (possibly trimmed) textarea content as "text" -
+ * an explicit edit, even if the human made no changes. false omits "text"
+ * entirely - "approve unchanged", for text too large to round-trip through
+ * this same 64KB-capped POST body; the agent keeps using what it already
+ * had, without the browser sending anything back. Irrelevant when denying.
+ */
+async function sendDataEditDecision(allow, withText) {
+  if (!dataEditJobId) return;
+  const body = !allow ? { allow: false }
+             : withText ? { allow: true, text: $('#data-edit-text').value }
+             : { allow: true };
+  /* Hide immediately, same reasoning as sendApproval: a slow-to-notice agent
+     should not make the click look like it did not register. */
+  hideDataEdit();
+  try {
+    await api(`/api/jobs/${encodeURIComponent(dataEditJobId)}/data-edit`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+  } catch (e) {
+    toast('Could not send the decision: ' + e.message, 'err');
+  }
+}
+
+$('#data-edit-send').onclick              = () => sendDataEditDecision(true, true);
+$('#data-edit-approve-unchanged').onclick = () => sendDataEditDecision(true, false);
+$('#data-edit-cancel').onclick            = () => sendDataEditDecision(false, false);
+$('#data-edit-text').oninput   = updateDataEditCounter;
+
 /* Set to false to stop an in-flight event stream (a chat job has no
    graph_done event to end it naturally). */
 let streaming = false;
 
 async function streamEvents(jobId) {
   approvalJobId = jobId;
+  dataEditJobId = jobId;
   streaming = true;
   let from = 0;
 

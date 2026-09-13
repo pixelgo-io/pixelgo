@@ -245,6 +245,179 @@ int approval_wait(const char *node, const char *tool, const char *input) {
     return 0;
 }
 
+/*
+ * Editable approval: same file-based convention as approval_file_path
+ * above (jobs/<id>.events -> jobs/<id>.data_edit for the decision), plus a
+ * second side file (jobs/<id>.data_edit_src) that carries the text being
+ * offered for editing. The text is NOT put through json_escape()/emit()
+ * into the journal: it can be arbitrarily large (that is the whole point
+ * of this feature), and journal lines are meant to stay small - an
+ * oversized event line is exactly the kind of thing that stalled the event
+ * route before it was fixed to return bounded batches.
+ */
+static int data_edit_file_path(char *out, size_t out_size) {
+    const char *ev = getenv("PIXELGO_EVENTS_FILE");
+    if (!ev || !ev[0]) return 0;
+
+    const char *dot = strrchr(ev, '.');
+    size_t base_len = dot ? (size_t)(dot - ev) : strlen(ev);
+    if (base_len + 11 >= out_size) return 0;
+
+    memcpy(out, ev, base_len);
+    out[base_len] = 0;
+    strncat(out, ".data_edit", out_size - base_len - 1);
+    return 1;
+}
+
+static int data_edit_source_path(char *out, size_t out_size) {
+    const char *ev = getenv("PIXELGO_EVENTS_FILE");
+    if (!ev || !ev[0]) return 0;
+
+    const char *dot = strrchr(ev, '.');
+    size_t base_len = dot ? (size_t)(dot - ev) : strlen(ev);
+    if (base_len + 15 >= out_size) return 0;
+
+    memcpy(out, ev, base_len);
+    out[base_len] = 0;
+    strncat(out, ".data_edit_src", out_size - base_len - 1);
+    return 1;
+}
+
+int data_edit_channel_available(void) {
+    char path[1024];
+    return data_edit_file_path(path, sizeof(path));
+}
+
+/* A small, separate event: announces that there is a large piece of text to
+   review, WITHOUT the text itself (see the comment above). The frontend
+   fetches the actual text from GET /api/jobs/<id>/data-edit-source. */
+static void event_data_edit_needed(const char *node, const char *tool,
+                                   size_t text_len) {
+    char n[128], t[64];
+    json_escape(node && node[0] ? node : g_node, n, sizeof(n));
+    json_escape(tool ? tool : "", t, sizeof(t));
+    emit("{\"t\":\"data_edit_needed\",\"ms\":%lld,\"node\":\"%s\",\"tool\":\"%s\",\"text_len\":%zu}",
+         now_ms() - g_start_ms, n, t, text_len);
+}
+
+static void event_data_edit_done(const char *node, const char *tool, int allowed) {
+    char n[128], t[64];
+    json_escape(node && node[0] ? node : g_node, n, sizeof(n));
+    json_escape(tool ? tool : "", t, sizeof(t));
+    emit("{\"t\":\"data_edit_done\",\"ms\":%lld,\"node\":\"%s\",\"tool\":\"%s\",\"allowed\":%d}",
+         now_ms() - g_start_ms, n, t, allowed);
+}
+
+int data_edit_wait(const char *node, const char *tool,
+                   const char *current_text,
+                   char *out_text, size_t out_text_cap,
+                   int *out_edited) {
+    char decision_path[1024], source_path[1024];
+    if (!data_edit_file_path(decision_path, sizeof(decision_path))) return 0;
+    if (!data_edit_source_path(source_path, sizeof(source_path))) return 0;
+
+    if (out_edited) *out_edited = 0;
+
+    /* Clear any stale files from a previous call before announcing. */
+    remove(decision_path);
+    remove(source_path);
+
+    size_t text_len = current_text ? strlen(current_text) : 0;
+
+    FILE *src = fopen(source_path, "w");
+    if (!src) {
+        LOG_W("data_edit: could not write the source file, denying");
+        return 0;
+    }
+    if (current_text) fwrite(current_text, 1, text_len, src);
+    fclose(src);
+
+    event_data_edit_needed(node, tool, text_len);
+
+    long waited_ms = 0;
+    while (waited_ms < APPROVAL_TIMEOUT_MS) {
+        FILE *f = fopen(decision_path, "r");
+        if (f) {
+            /* The marker is "allow" (5 bytes) or "deny" (4 bytes). Reading
+               exactly 5 bytes is deliberate: reading MORE would eat the
+               first bytes of whatever follows along with the marker,
+               corrupting it silently - which is exactly what an earlier
+               version of this function did. */
+            char marker[6] = {0};
+            size_t got = fread(marker, 1, 5, f);
+            marker[got] = 0;
+
+            int allowed = (got >= 1 && marker[0] == 'a');
+
+            if (allowed) {
+                /*
+                 * After "allow" comes exactly one mode byte:
+                 *   'E' -> edited: the human's text follows, byte for byte.
+                 *   'U' -> unchanged: nothing follows. The source text can
+                 *          be arbitrarily large (served straight off disk,
+                 *          no cap), but the human's browser can only POST
+                 *          back up to HTTP_MAX_BODY - "unchanged" is how
+                 *          they approve something too big to round-trip,
+                 *          without the browser ever re-uploading it.
+                 * A file that ends right after "allow" (no mode byte at
+                 * all - e.g. hand-written during testing) is treated as
+                 * unchanged rather than as a parse error: fail toward the
+                 * cheaper, no-data-loss interpretation.
+                 */
+                char mode = 0;
+                size_t mode_got = fread(&mode, 1, 1, f);
+                int edited = (mode_got == 1 && mode == 'E');
+                if (out_edited) *out_edited = edited;
+
+                if (edited && out_text && out_text_cap > 0) {
+                    /* The cursor sits right after the mode byte - the
+                       edited text starts exactly here. */
+                    long after_marker = ftell(f);
+                    if (after_marker >= 0) {
+                        fseek(f, 0, SEEK_END);
+                        long total = ftell(f);
+                        fseek(f, after_marker, SEEK_SET);
+                        long remaining = total - after_marker;
+
+                        if (remaining < 0) remaining = 0;
+                        size_t to_read = (size_t)remaining;
+                        if (to_read >= out_text_cap) {
+                            to_read = out_text_cap - 1;
+                            LOG_W("data_edit: edited text (%ld bytes) exceeds the "
+                                  "%zu-byte cap, truncating - not corrupting: the "
+                                  "extra bytes are dropped, never silently mixed in",
+                                  remaining, out_text_cap);
+                        }
+                        size_t n = fread(out_text, 1, to_read, f);
+                        out_text[n] = 0;
+                    } else {
+                        out_text[0] = 0;
+                    }
+                }
+            }
+
+            fclose(f);
+            remove(decision_path);
+            remove(source_path);
+
+            event_data_edit_done(node, tool, allowed);
+            LOG_I("data_edit: '%s' %s by the human%s", tool,
+                  allowed ? "allowed" : "denied",
+                  (allowed && out_edited && *out_edited) ? " (edited)" :
+                  (allowed ? " (unchanged)" : ""));
+            return allowed;
+        }
+        usleep(APPROVAL_POLL_US);
+        waited_ms += APPROVAL_POLL_US / 1000;
+    }
+
+    remove(source_path);
+    LOG_W("data_edit: no decision for '%s' within %ds, denying",
+          tool, APPROVAL_TIMEOUT_MS / 1000);
+    event_data_edit_done(node, tool, 0);
+    return 0;
+}
+
 int events_open_from_env(void) {
     if (g_events) return 1;
 

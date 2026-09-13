@@ -79,4 +79,12 @@ int jobs_events_path(const char *job_id, char *out, size_t out_size);
    The agent polls this file while it is blocked waiting for you. */
 int jobs_approval_path(const char *job_id, char *out, size_t out_size);
 
+/* Same idea as jobs_approval_path, for the editable-approval feature
+   (data_edit_wait in events.c): jobs/<id>.data_edit carries the decision
+   (allow/deny + the final text), jobs/<id>.data_edit_src carries the
+   original text being offered for editing, which the browser fetches
+   separately since it can be large. */
+int jobs_data_edit_path(const char *job_id, char *out, size_t out_size);
+int jobs_data_edit_source_path(const char *job_id, char *out, size_t out_size);
+
 #endif
