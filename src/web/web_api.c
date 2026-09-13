@@ -356,10 +356,16 @@ static void route_job_get(const http_req_t *req, http_res_t *res) {
 
                 cJSON *ti = cJSON_GetObjectItemCaseSensitive(r, "total_input_tokens");
                 cJSON *to = cJSON_GetObjectItemCaseSensitive(r, "total_output_tokens");
+                cJSON *tcw = cJSON_GetObjectItemCaseSensitive(r, "total_cache_write_tokens");
+                cJSON *tcr = cJSON_GetObjectItemCaseSensitive(r, "total_cache_read_tokens");
                 cJSON *tc = cJSON_GetObjectItemCaseSensitive(r, "total_cost_micro_usd");
+                cJSON *tnc = cJSON_GetObjectItemCaseSensitive(r, "total_cost_no_cache_micro_usd");
                 cJSON_AddNumberToObject(o, "total_input_tokens",  cJSON_IsNumber(ti) ? ti->valuedouble : 0);
                 cJSON_AddNumberToObject(o, "total_output_tokens", cJSON_IsNumber(to) ? to->valuedouble : 0);
+                cJSON_AddNumberToObject(o, "total_cache_write_tokens", cJSON_IsNumber(tcw) ? tcw->valuedouble : 0);
+                cJSON_AddNumberToObject(o, "total_cache_read_tokens", cJSON_IsNumber(tcr) ? tcr->valuedouble : 0);
                 cJSON_AddNumberToObject(o, "total_cost_micro_usd", cJSON_IsNumber(tc) ? tc->valuedouble : 0);
+                cJSON_AddNumberToObject(o, "total_cost_no_cache_micro_usd", cJSON_IsNumber(tnc) ? tnc->valuedouble : 0);
                 cJSON_Delete(r);
             } else {
                 cJSON_AddItemToObject(o, "outputs", cJSON_CreateArray());

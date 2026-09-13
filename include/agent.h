@@ -52,6 +52,34 @@ typedef struct {
     int  argc;
 } worker_config_t;
 
+/*
+ * Prompt caching (Anthropic only, for now - the other providers either cache
+ * automatically server-side, on OpenAI, or use a different mechanism, on
+ * Gemini). FOUR states, mirroring approve_data_threshold_bytes below:
+ *
+ *   CACHE_MODE_UNSET (0, the zero-initialized default) - no --cache flag was
+ *     given for this agent. Resolved at request time (provider_resolve_cache_mode):
+ *     inherits PIXELGO_CACHE_MODE from the environment if set, otherwise
+ *     falls back to CACHE_MODE_AUTO - same "explicit always wins, missing
+ *     flag inherits the global" rule as --data-threshold.
+ *   CACHE_MODE_AUTO - pixelgo decides per request. Worth caching when there
+ *     is more than one request in the conversation, because that is exactly
+ *     when a cached prefix gets reused: an agent with tools almost always
+ *     makes a second request (the first one is rarely the final answer), and
+ *     a persisted `agent chat` already has history from earlier turns before
+ *     this one even starts. An agent with no tools, asked a single one-shot
+ *     question, makes exactly one request ever - marking it cacheable there
+ *     is pure cost (the ~25% write surcharge) with no read to earn it back.
+ *   CACHE_MODE_ON  - always mark the request cacheable, regardless.
+ *   CACHE_MODE_OFF - never mark it, regardless.
+ */
+typedef enum {
+    CACHE_MODE_UNSET = 0,
+    CACHE_MODE_AUTO,
+    CACHE_MODE_ON,
+    CACHE_MODE_OFF
+} cache_mode_t;
+
 /* Config for an AI-type agent */
 typedef struct {
     llm_provider_id_t provider;  /* anthropic / openai / gemini */
@@ -59,6 +87,7 @@ typedef struct {
     char system_prompt[2048];
     char tools[MAX_TOOLS][MAX_STR];
     int  tool_count;
+    cache_mode_t cache_mode;      /* prompt caching: auto (default) / on / off */
     char run_command_allowlist[MAX_ALLOWLIST][MAX_STR];
     int  allowlist_count;
 

@@ -55,6 +55,29 @@ int provider_should_retry(long http_code, int curl_ok) {
     return 0;
 }
 
+cache_mode_t provider_resolve_cache_mode(cache_mode_t stored) {
+    if (stored != CACHE_MODE_UNSET) return stored;   /* explicit --cache always wins */
+
+    const char *env = getenv("PIXELGO_CACHE_MODE");
+    if (env) {
+        if (strcmp(env, "on")   == 0) return CACHE_MODE_ON;
+        if (strcmp(env, "off")  == 0) return CACHE_MODE_OFF;
+        if (strcmp(env, "auto") == 0) return CACHE_MODE_AUTO;
+        LOG_W("provider: unrecognized PIXELGO_CACHE_MODE '%s' (expected "
+              "\"auto\", \"on\", or \"off\"), falling back to \"auto\"", env);
+    }
+    return CACHE_MODE_AUTO;   /* no flag, no env var (or an unrecognized one) */
+}
+
+int provider_cache_decision(cache_mode_t mode, int tool_count, int message_count) {
+    if (mode == CACHE_MODE_ON)  return 1;
+    if (mode == CACHE_MODE_OFF) return 0;
+    /* CACHE_MODE_AUTO (and, defensively, a stray CACHE_MODE_UNSET that
+       reached here unresolved): cache unless we can already be sure no one
+       will ever read back what we would write - see provider_internal.h. */
+    return (tool_count > 0) || (message_count > 1);
+}
+
 /* --- public dispatcher with retry --- */
 
 int provider_call(const agent_t *agent, const cJSON *messages, const cJSON *tools,

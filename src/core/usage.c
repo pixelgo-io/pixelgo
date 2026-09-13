@@ -153,11 +153,42 @@ long usage_cost_if_all_on(llm_provider_id_t provider, const char *model,
     return usage_cost_micro(provider, model, input_tokens, output_tokens);
 }
 
+/*
+ * Fixed by Anthropic's cache pricing (5-minute, "ephemeral" TTL - the only kind
+ * this project writes), not by the model: a write costs 25% more than a plain
+ * input token, a read costs 90% less. If a longer-lived (1-hour) cache is ever
+ * added, this is the one place that needs a second multiplier.
+ */
+#define CACHE_WRITE_MULTIPLIER 1.25
+#define CACHE_READ_MULTIPLIER  0.10
+
+long usage_cost_micro_cached(llm_provider_id_t provider, const char *model,
+                             long input_tokens, long output_tokens,
+                             long cache_write_tokens, long cache_read_tokens) {
+    if (!model || !model[0]) return 0;
+
+    const price_t *p = find_price(provider, model);
+    if (!p) {
+        LOG_W("usage: I do not know the price for '%s' (%s). Add it to pricing.conf.",
+              model, provider_to_string(provider));
+        return 0;
+    }
+
+    long cost = 0;
+    cost += (input_tokens  * p->input_per_mtok)  / 1000000;
+    cost += (output_tokens * p->output_per_mtok) / 1000000;
+    cost += (long)((double)cache_write_tokens * p->input_per_mtok * CACHE_WRITE_MULTIPLIER) / 1000000;
+    cost += (long)((double)cache_read_tokens  * p->input_per_mtok * CACHE_READ_MULTIPLIER)  / 1000000;
+    return cost;
+}
+
 void usage_add(usage_t *total, const usage_t *add) {
     if (!total || !add) return;
-    total->input_tokens   += add->input_tokens;
-    total->output_tokens  += add->output_tokens;
-    total->cost_micro_usd += add->cost_micro_usd;
+    total->input_tokens       += add->input_tokens;
+    total->output_tokens      += add->output_tokens;
+    total->cache_write_tokens += add->cache_write_tokens;
+    total->cache_read_tokens  += add->cache_read_tokens;
+    total->cost_micro_usd     += add->cost_micro_usd;
 }
 
 void usage_format_cost(long cost_micro_usd, char *out, size_t out_size) {
