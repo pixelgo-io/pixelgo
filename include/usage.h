@@ -22,6 +22,17 @@
 typedef struct {
     long input_tokens;
     long output_tokens;
+    /*
+     * Prompt-cache tokens (Anthropic only for now; other adapters leave these
+     * at 0, which is always correct for them - no special-casing needed
+     * elsewhere). These are NOT included in input_tokens: Anthropic reports
+     * them as separate counters, and they are priced differently (writing a
+     * cache entry costs more than a plain input token, reading one costs
+     * much less), so folding them into input_tokens would silently misprice
+     * every cached request.
+     */
+    long cache_write_tokens;     /* tokens written into a new cache entry   */
+    long cache_read_tokens;      /* tokens served from an existing entry    */
     /* The cost in micro-dollars (1 USD = 1,000,000). We use integers to avoid
        floating-point rounding errors when summing. */
     long cost_micro_usd;
@@ -38,6 +49,20 @@ void usage_add(usage_t *total, const usage_t *add);
  */
 long usage_cost_micro(llm_provider_id_t provider, const char *model,
                       long input_tokens, long output_tokens);
+
+/*
+ * Same as usage_cost_micro, but also prices the two cache counters:
+ *   cache_write_tokens - charged at CACHE_WRITE_MULTIPLIER x the model's
+ *                        normal input price (Anthropic: ~1.25x, 5-minute TTL)
+ *   cache_read_tokens  - charged at CACHE_READ_MULTIPLIER x the model's
+ *                        normal input price (Anthropic: ~0.1x)
+ * Both multipliers are fixed by the provider, not the model, so they are not
+ * part of the pricing table - they are applied on top of whatever
+ * input_per_mtok that table already has for the model.
+ */
+long usage_cost_micro_cached(llm_provider_id_t provider, const char *model,
+                             long input_tokens, long output_tokens,
+                             long cache_write_tokens, long cache_read_tokens);
 
 /* Formats the cost for display: "$0.0342". out must be >= 16 bytes. */
 void usage_format_cost(long cost_micro_usd, char *out, size_t out_size);

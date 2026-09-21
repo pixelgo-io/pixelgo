@@ -193,6 +193,78 @@ undo your configuration. And if nobody can be asked (no terminal, no browser
 attached), the answer is **no**: an agent set up to need approval never acts
 unsupervised just because nobody was watching.
 
+## Prompt caching
+
+Anthropic agents (OpenAI/Gemini don't take this flag yet) can mark their
+requests cacheable, so the provider re-charges only ~10% for a system prompt,
+tool definitions, and conversation prefix it has already seen, instead of the
+full price every single turn. This matters here specifically: a tool-using
+agent resends its ENTIRE growing conversation on every turn (there is no
+server-side session), so a 5-step tool loop pays for the same early tokens
+five times over without caching.
+
+By default, `--cache` is not something you need to think about — pixelgo
+decides automatically per request:
+
+```bash
+./pixelgo agent add ai demo coder anthropic claude-sonnet-5 \
+  "You are a C programmer." \
+  "read_file,write_file,run_command" "gcc,make"
+  # no --cache flag: inherits PIXELGO_CACHE_MODE if set, otherwise auto
+```
+
+`auto` caches whenever a cached prefix is likely to actually get reused:
+the agent has tools (so it will very likely make a second request — the
+first reply is rarely the final answer), or the conversation already has
+history (a continuing `agent chat`, or a later turn of a tool loop). It does
+*not* cache a tool-less agent's first, one-shot request — that request is
+guaranteed to be the only one, so marking it cacheable would just pay the
+~25% write surcharge for a read that can never happen.
+
+Override it explicitly per agent when the default guesses wrong for your
+case:
+
+```bash
+./pixelgo agent add ai demo classifier anthropic claude-sonnet-5 \
+  "..." "" "" --cache off   # a tool-less agent you know runs only once
+```
+
+`--cache on` forces caching even for a tool-less single-shot agent (useful if
+you know it will actually be invoked repeatedly, e.g. from a script, within
+the cache's 5-minute window). `--cache off` disables it outright.
+
+Like `--data-threshold`, an agent with no `--cache` flag at all inherits a
+global default from `PIXELGO_CACHE_MODE` (in `.env` or the environment) —
+handy to flip every agent in a workspace at once without editing each one:
+
+```bash
+export PIXELGO_CACHE_MODE=off   # applies to every agent that doesn't set
+                                 # its own --cache
+```
+
+An explicit `--cache` on a given agent always overrides the environment
+variable — only agents with no flag at all inherit it.
+
+The cost report (`pixelgo flow run`'s summary, and `_usage.json` per agent)
+breaks out `cache_write`/`cache_read` tokens separately from plain input
+tokens, and — when any caching happened — prints what the same run would
+have cost with caching turned off entirely, next to the existing "if the
+whole graph had run on the priciest model" comparison.
+
+**Caching survives across separate invocations of the same agent, not just
+within one tool loop.** Each node in a flow runs as its own process with its
+own fresh conversation (see "Flows" above) — a `coder` <-> `reviewer`
+correction loop starts `reviewer` as a brand-new conversation every time
+control comes back to it. But its `system_prompt` and `tools` are byte-for-
+byte identical on every invocation, so the cache entry a `reviewer` run
+writes is still there — and gets billed as a cheap read — the next time
+`reviewer` runs, even though it's a different process with no memory of the
+first one. This is a side effect of how the cache is keyed (on the prefix
+itself, not on any pixelgo-level session), not something this project
+tracks or guarantees — and it only holds if the two invocations land within
+the cache's 5-minute TTL, which is easy for a small demo but worth keeping
+in mind for a flow with several correction rounds over large files.
+
 ## Guarding against oversized requests
 
 `--approve` gates *what an agent does*. `--data-threshold` gates *what it
@@ -327,6 +399,7 @@ final component was appended as text. `read_file` would have followed it out.
 workspace create <name>
 agent add worker <ws> <id> <command> [args...]
 agent add ai     <ws> <id> <provider> <model> <prompt> <tool1,tool2,...> [cmd1,cmd2,...]
+                 [--approve <tools>] [--cache <auto|on|off>] [--data-threshold <size>]
 agent run  <ws> <id> [task]
 agent chat <ws> <id> [--reset]      # conversation, remembers
 agent list <ws>

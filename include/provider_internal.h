@@ -55,4 +55,42 @@ int gemini_call(const agent_t *agent, const char *api_key,
    The adapters do NOT implement retry themselves; they get it from the dispatcher. */
 int provider_should_retry(long http_code, int curl_ok);
 
+/*
+ * Resolves a stored cache_mode_t against PIXELGO_CACHE_MODE, exactly like the
+ * PIXELGO_DATA_THRESHOLD / --data-threshold global default: CACHE_MODE_UNSET
+ * means "no --cache flag was given for this agent", so it inherits the
+ * environment variable if set, falling back to CACHE_MODE_AUTO if the
+ * variable is unset or unrecognized. Any other stored value (AUTO/ON/OFF,
+ * from an explicit --cache) is returned unchanged - an explicit per-agent
+ * choice always wins over the global default, never the other way round.
+ */
+cache_mode_t provider_resolve_cache_mode(cache_mode_t stored);
+
+/*
+ * Decides whether THIS request should be marked cacheable, given an ALREADY
+ * RESOLVED cache_mode_t (see provider_resolve_cache_mode above - callers must
+ * resolve CACHE_MODE_UNSET before calling this) and two signals available
+ * before any call is made:
+ *
+ *   tool_count      - how many tools the agent is configured with. An agent
+ *                     with tools very rarely stops at one request (the first
+ *                     reply is usually a tool_use, not the final answer), so
+ *                     the prefix it just sent is likely to be resent (and
+ *                     therefore worth caching) on the very next turn.
+ *   message_count   - the size of the `messages` array about to be sent,
+ *                     BEFORE this call. If it is already more than 1, this is
+ *                     either the Nth turn of a tool loop, or an `agent chat`
+ *                     continuing from persisted history - either way, a
+ *                     cacheable prefix already exists from earlier calls.
+ *
+ * A tool-less agent's very first, one-shot request (tool_count == 0 AND
+ * message_count <= 1) is the one case pixelgo can be SURE will never see a
+ * second request: nothing will ever read back what caching it would write, so
+ * CACHE_MODE_AUTO deliberately does not cache it - marking it would only pay
+ * the write surcharge for a read that can't happen.
+ *
+ * Pure function (no I/O), so it is unit-tested directly without a network call.
+ */
+int provider_cache_decision(cache_mode_t mode, int tool_count, int message_count);
+
 #endif

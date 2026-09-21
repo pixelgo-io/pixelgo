@@ -313,6 +313,7 @@ int job_start_flow(const char *ws_name, const char *flow_file,
     /* we collect the output AND the cost of each node */
     cJSON *outputs = cJSON_CreateArray();
     long total_in = 0, total_out = 0, total_cost = 0;
+    long total_cache_write = 0, total_cache_read = 0, total_no_cache = 0;
 
     for (int i = 0; i < g.node_count; i++) {
         agent_t *a = workspace_find_agent(&ws, g.nodes[i]);
@@ -347,20 +348,46 @@ int job_start_flow(const char *ws_name, const char *flow_file,
             if (u) {
                 cJSON *in   = cJSON_GetObjectItemCaseSensitive(u, "input_tokens");
                 cJSON *o    = cJSON_GetObjectItemCaseSensitive(u, "output_tokens");
+                cJSON *cw   = cJSON_GetObjectItemCaseSensitive(u, "cache_write_tokens");
+                cJSON *cr   = cJSON_GetObjectItemCaseSensitive(u, "cache_read_tokens");
                 cJSON *cost = cJSON_GetObjectItemCaseSensitive(u, "cost_micro_usd");
                 char model[MAX_STR] = "";
+                char prov_str[MAX_STR] = "";
                 json_get_string(u, "model", model, sizeof(model));
+                json_get_string(u, "provider", prov_str, sizeof(prov_str));
 
-                long li = cJSON_IsNumber(in)   ? (long)in->valuedouble   : 0;
-                long lo = cJSON_IsNumber(o)    ? (long)o->valuedouble    : 0;
-                long lc = cJSON_IsNumber(cost) ? (long)cost->valuedouble : 0;
+                long li  = cJSON_IsNumber(in)   ? (long)in->valuedouble   : 0;
+                long lo  = cJSON_IsNumber(o)    ? (long)o->valuedouble    : 0;
+                long lcw = cJSON_IsNumber(cw)   ? (long)cw->valuedouble   : 0;
+                long lcr = cJSON_IsNumber(cr)   ? (long)cr->valuedouble   : 0;
+                long lc  = cJSON_IsNumber(cost) ? (long)cost->valuedouble : 0;
 
                 cJSON_AddStringToObject(no, "model", model);
                 cJSON_AddNumberToObject(no, "input_tokens", (double)li);
                 cJSON_AddNumberToObject(no, "output_tokens", (double)lo);
+                cJSON_AddNumberToObject(no, "cache_write_tokens", (double)lcw);
+                cJSON_AddNumberToObject(no, "cache_read_tokens", (double)lcr);
                 cJSON_AddNumberToObject(no, "cost_micro_usd", (double)lc);
 
+                /*
+                 * What this node would have cost with caching off entirely -
+                 * i.e. cache_write/cache_read tokens billed as plain input.
+                 * Computed here (server-side, where the price table lives),
+                 * not in the browser: the JS UI has no pricing data of its
+                 * own, and duplicating pricing.conf into client-side code
+                 * would just be a second place for prices to go stale.
+                 */
+                if (prov_str[0] && model[0]) {
+                    llm_provider_id_t prov = provider_from_string(prov_str);
+                    long no_cache = usage_cost_micro(prov, model, li + lcw + lcr, lo);
+                    cJSON_AddNumberToObject(no, "cost_no_cache_micro_usd", (double)no_cache);
+                    total_no_cache += no_cache;
+                } else {
+                    total_no_cache += lc;   /* no price info -> assume no difference */
+                }
+
                 total_in += li; total_out += lo; total_cost += lc;
+                total_cache_write += lcw; total_cache_read += lcr;
                 cJSON_Delete(u);
             }
         }
@@ -372,7 +399,10 @@ int job_start_flow(const char *ws_name, const char *flow_file,
     cJSON_AddItemToObject(wrapper, "nodes", outputs);
     cJSON_AddNumberToObject(wrapper, "total_input_tokens", (double)total_in);
     cJSON_AddNumberToObject(wrapper, "total_output_tokens", (double)total_out);
+    cJSON_AddNumberToObject(wrapper, "total_cache_write_tokens", (double)total_cache_write);
+    cJSON_AddNumberToObject(wrapper, "total_cache_read_tokens", (double)total_cache_read);
     cJSON_AddNumberToObject(wrapper, "total_cost_micro_usd", (double)total_cost);
+    cJSON_AddNumberToObject(wrapper, "total_cost_no_cache_micro_usd", (double)total_no_cache);
 
     static char result[JOB_RESULT_MAX];
     if (!json_serialize(wrapper, result, sizeof(result)))

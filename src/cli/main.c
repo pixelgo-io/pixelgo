@@ -33,6 +33,10 @@ static void print_usage(void) {
         "                   tools:    read_file, write_file, list_dir, run_command, search_files\n"
         "                   last argument (optional): commands allowed for run_command, e.g. \"gcc,make\"\n"
         "                   --approve <tool1,tool2>: ask you before those tools run, e.g. \"write_file,run_command\"\n"
+        "                   --cache <auto|on|off>: prompt caching for Anthropic agents. No flag inherits\n"
+        "                                          PIXELGO_CACHE_MODE if set, otherwise \"auto\" (caches when\n"
+        "                                          a second request is likely: the agent has tools, or an\n"
+        "                                          `agent chat` already has history)\n"
         "                   --data-threshold <size>: ask you before a request over this size is sent to the\n"
         "                                            provider, e.g. \"500KB\", \"2MB\", or \"off\" to explicitly\n"
         "                                            disable it for this agent. Default: inherits\n"
@@ -173,7 +177,8 @@ static int cmd_agent_add_ai(const char *ws_name, const char *agent_id,
                              const char *prompt, const char *tools_csv,
                              const char *allowlist_csv,
                              const char *approval_csv,
-                             const char *data_threshold_str) {
+                             const char *data_threshold_str,
+                             const char *cache_str) {
     char ws_path[MAX_PATH_LEN];
     snprintf(ws_path, MAX_PATH_LEN, "%s/%s", BASE_DIR, ws_name);
 
@@ -256,6 +261,24 @@ static int cmd_agent_add_ai(const char *ws_name, const char *agent_id,
                     "agent will fall back to PIXELGO_DATA_THRESHOLD if set "
                     "(expected e.g. \"500KB\", \"2MB\", or \"off\")\n", data_threshold_str);
         }
+    }
+
+    /*
+     * Prompt caching: "auto", "on", or "off". No flag at all leaves it UNSET,
+     * which inherits PIXELGO_CACHE_MODE at request time if set, otherwise
+     * falls back to "auto" - same rule as --data-threshold below. An explicit
+     * --cache here always wins over the environment variable.
+     */
+    agent.cfg.ai.cache_mode = CACHE_MODE_UNSET;
+    if (cache_str && cache_str[0]) {
+        if (strcmp(cache_str, "on") == 0)        agent.cfg.ai.cache_mode = CACHE_MODE_ON;
+        else if (strcmp(cache_str, "off") == 0)  agent.cfg.ai.cache_mode = CACHE_MODE_OFF;
+        else if (strcmp(cache_str, "auto") == 0) agent.cfg.ai.cache_mode = CACHE_MODE_AUTO;
+        else
+            fprintf(stderr,
+                    "Warning: unknown --cache value '%s' (expected \"auto\", \"on\", "
+                    "or \"off\"), leaving it unset (inherits PIXELGO_CACHE_MODE, or "
+                    "\"auto\" if that is not set either)\n", cache_str);
     }
 
     int has_run_command = 0;
@@ -543,17 +566,20 @@ int main(int argc, char **argv) {
                 const char *allow = NULL;
                 const char *approve = NULL;
                 const char *data_threshold = NULL;
+                const char *cache = NULL;
                 for (int i = 10; i < argc; i++) {
                     if (strcmp(argv[i], "--approve") == 0 && i + 1 < argc) {
                         approve = argv[++i];
                     } else if (strcmp(argv[i], "--data-threshold") == 0 && i + 1 < argc) {
                         data_threshold = argv[++i];
+                    } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
+                        cache = argv[++i];
                     } else if (!allow) {
                         allow = argv[i];
                     }
                 }
                 return cmd_agent_add_ai(argv[4], argv[5], argv[6], argv[7], argv[8],
-                                        argv[9], allow, approve, data_threshold);
+                                        argv[9], allow, approve, data_threshold, cache);
             }
         }
         if (strcmp(argv[2], "run") == 0 && argc >= 5) {
