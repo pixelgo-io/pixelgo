@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strncasecmp - in <strings.h> on macOS, a target platform */
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -101,6 +102,39 @@ int http_query_get(const char *query, const char *key, char *out, size_t out_siz
 
 /* --- parsing the request --- */
 
+/*
+ * Copies one header's value into out, trimmed of surrounding spaces.
+ *
+ * `name` carries its own leading "\r\n" so the search can never match the
+ * request line - only a real header. The match is case-insensitive because
+ * header names are, and the search is bounded by hdr_end so a value in the
+ * BODY that happens to look like a header is never picked up.
+ *
+ * out is always NUL-terminated, and is left empty when the header is absent.
+ */
+static void header_value(const char *raw, const char *hdr_end,
+                         const char *name, char *out, size_t out_size) {
+    out[0] = 0;
+
+    const char *p = strcasestr(raw, name);
+    if (!p || p >= hdr_end) return;
+
+    p = strchr(p, ':');
+    if (!p) return;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+
+    const char *end = strstr(p, "\r\n");
+    if (!end || end > hdr_end) end = hdr_end;
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t')) end--;
+
+    size_t len = (size_t)(end - p);
+    if (len >= out_size) len = out_size - 1;   /* truncation can only fail the
+                                                  check, never pass it */
+    memcpy(out, p, len);
+    out[len] = 0;
+}
+
 /* Parses the request line and the headers; determines Content-Length.
    Returns 1 on success. */
 static int parse_request(const char *raw, size_t raw_len, http_req_t *req,
@@ -144,8 +178,91 @@ static int parse_request(const char *raw, size_t raw_len, http_req_t *req,
         cl = strchr(cl, ':');
         if (cl) *content_length = (size_t)strtoul(cl + 1, NULL, 10);
     }
+
+    header_value(raw, hdr_end, "\r\nhost:",   req->host,   sizeof(req->host));
+    header_value(raw, hdr_end, "\r\norigin:", req->origin, sizeof(req->origin));
+
     (void)raw_len;
     return 1;
+}
+
+/* --- who is allowed to reach a handler (see http_server.h) --- */
+
+/* Is this hostname one of ours? localhost and 127.0.0.1 always; anything in
+   PIXELGO_ALLOWED_HOSTS as well, for a container mapping or a reverse proxy,
+   where the Host the client uses is not one we could guess. */
+static int name_is_ours(const char *name, size_t len) {
+    if (len == 0) return 0;
+
+    /* both are nine characters, which is a happy accident */
+    if (len == 9 && (strncasecmp(name, "localhost", 9) == 0 ||
+                     strncasecmp(name, "127.0.0.1", 9) == 0))
+        return 1;
+
+    const char *list = getenv("PIXELGO_ALLOWED_HOSTS");
+    if (!list) return 0;
+
+    while (*list) {
+        while (*list == ',' || *list == ' ') list++;
+        const char *end = list;
+        while (*end && *end != ',' && *end != ' ') end++;
+
+        size_t elen = (size_t)(end - list);
+        if (elen == len && strncasecmp(list, name, len) == 0) return 1;
+        list = end;
+    }
+    return 0;
+}
+
+/* "name" or "name:port" - ours, and on the port we actually bound?
+   A bare name means port 80, so it only passes when that is where we are. */
+static int authority_is_ours(const char *authority, int port) {
+    if (!authority || !authority[0]) return 0;
+
+    const char *colon = strrchr(authority, ':');
+    size_t nlen;
+
+    if (colon) {
+        nlen = (size_t)(colon - authority);
+        char *endp = NULL;
+        long p = strtol(colon + 1, &endp, 10);
+        if (!endp || *endp != 0 || p != (long)port) return 0;
+    } else {
+        nlen = strlen(authority);
+        if (port != 80) return 0;
+    }
+    return name_is_ours(authority, nlen);
+}
+
+int http_origin_allowed(const http_req_t *req, int port) {
+    if (!req) return 0;
+
+    /* Host must name us. This is what defeats DNS rebinding: the rebinding
+       site's requests carry its own hostname, not ours. A request with no
+       Host at all is refused too - HTTP/1.1 requires one, and every browser
+       and every version of curl sends it. */
+    if (!authority_is_ours(req->host, port)) return 0;
+
+    /* A safe method with a correct Host is fine. A third-party page can still
+       cause a GET, but no GET route changes anything, and the page cannot read
+       the answer: we grant no CORS. */
+    if (strcmp(req->method, "GET") == 0 || strcmp(req->method, "HEAD") == 0)
+        return 1;
+
+    /* State-changing. No Origin means the caller is not a browser acting for
+       some page - curl, a script, our own tests. Allowed, and it has already
+       passed the Host check. */
+    if (req->origin[0] == 0) return 1;
+
+    /* There is an Origin, so a browser is telling us which page is asking.
+       It has to be us. Anything carrying a scheme we do not serve - "null",
+       a local file, a browser extension - is refused. */
+    const char *o = req->origin;
+    if      (strncasecmp(o, "http://",  7) == 0) o += 7;
+    else if (strncasecmp(o, "https://", 8) == 0) o += 8;
+    else return 0;
+
+    return authority_is_ours(o, port);
 }
 
 /*
@@ -450,9 +567,18 @@ int http_serve(int port, http_handler_fn handler) {
 
             if (read_request(fd, &req)) {
                 LOG_D("http: %s %s", req.method, req.path);
-                handler(&req, &res);
-                if (res.status == 0)
-                    http_res_error(&res, 500, "the handler did not set the response");
+
+                /* Before routing: is this request allowed to reach a handler
+                   at all? See http_origin_allowed() in http_server.h. */
+                if (!http_origin_allowed(&req, port)) {
+                    LOG_W("http: refused %s %s (Host='%s' Origin='%s')",
+                          req.method, req.path, req.host, req.origin);
+                    http_res_error(&res, 403, "forbidden: Host or Origin is not this server");
+                } else {
+                    handler(&req, &res);
+                    if (res.status == 0)
+                        http_res_error(&res, 500, "the handler did not set the response");
+                }
                 send_response(fd, &res);
                 if (res.body_is_heap && res.body) free(res.body);
             }

@@ -43,9 +43,18 @@ on one side only.
   whatever URL the guest names, which is an outbound request from the host on
   the guest's behalf. A 3xx is a contract violation and must be refused, not
   passed on.
-- **The status codes listed per route are exhaustive.** Any other status is a
-  contract violation. Together with the rule above this means: 2xx as
-  documented, or 4xx/5xx with a JSON error body, and nothing else.
+- **The status codes listed per route are exhaustive**, with one exception
+  below. Any other status is a contract violation. Together with the rule above
+  this means: 2xx as documented, or 4xx/5xx with a JSON error body, and nothing
+  else.
+- **403 is answered before routing and applies to every route.** A request
+  whose `Host` header does not name this server, or whose `Origin` on a
+  state-changing method names someone else, is refused with
+  `403 {"error": "..."}` without reaching a handler. It is therefore not
+  listed per route. A caller that sets `Host` correctly never sees it; the
+  check exists to stop a browser being used by a third-party page to drive
+  this API, and to defeat DNS rebinding. Accepted names are `localhost` and
+  `127.0.0.1` on the bound port, plus anything in `PIXELGO_ALLOWED_HOSTS`.
 - **Maximum size** is a hard cap on the response body, errors included. The
   server enforces it for every route in one place; a response that would exceed
   it is replaced by `500 {"error":"response exceeds the contract maximum"}`.
