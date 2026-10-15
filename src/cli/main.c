@@ -7,6 +7,7 @@
 #include "history.h"
 #include "ai_loop.h"
 #include "http_server.h"
+#include "web_api.h"
 #include "daemon.h"
 #include "jobs.h"
 #include "envfile.h"
@@ -441,7 +442,6 @@ static int cmd_agent_chat(const char *ws_name, const char *agent_id, int reset) 
 
 /* Starts the web interface. The server is in-process (no fork): it serves the
    frontend and the JSON API, calling exactly the same functions as the CLI. */
-void web_handler(const http_req_t *req, http_res_t *res);   /* in web_api.c */
 
 static int cmd_serve(int port, int as_daemon) {
     if (as_daemon) {

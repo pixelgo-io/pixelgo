@@ -38,14 +38,33 @@ void http_res_static(http_res_t *res, int status, const char *content_type,
 }
 
 void http_res_error(http_res_t *res, int status, const char *message) {
-    /* We escape the quotes in the message so we do not break the JSON. */
+    /*
+     * Escape everything JSON requires inside a string: the quote, the
+     * backslash, and every control character below 0x20. Only escaping the
+     * first two (as this used to) produced invalid JSON as soon as a message
+     * carried a newline - and error messages can include caller-supplied
+     * text. The longest escape is 6 bytes (\u00XX), so the loop stops while
+     * there is still room for one more plus the terminator: a long message
+     * is truncated, never broken mid-escape.
+     */
     char escaped[1024];
     size_t j = 0;
-    for (size_t i = 0; message[i] && j < sizeof(escaped) - 2; i++) {
-        if (message[i] == '"' || message[i] == '\\') {
-            if (j < sizeof(escaped) - 3) escaped[j++] = '\\';
+    for (size_t i = 0; message[i] && j + 7 <= sizeof(escaped); i++) {
+        unsigned char c = (unsigned char)message[i];
+        if (c == '"' || c == '\\') {
+            escaped[j++] = '\\';
+            escaped[j++] = (char)c;
+        } else if (c == '\n') {
+            escaped[j++] = '\\'; escaped[j++] = 'n';
+        } else if (c == '\r') {
+            escaped[j++] = '\\'; escaped[j++] = 'r';
+        } else if (c == '\t') {
+            escaped[j++] = '\\'; escaped[j++] = 't';
+        } else if (c < 0x20) {
+            j += (size_t)snprintf(escaped + j, sizeof(escaped) - j, "\\u%04x", c);
+        } else {
+            escaped[j++] = (char)c;
         }
-        escaped[j++] = message[i];
     }
     escaped[j] = 0;
 
