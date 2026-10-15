@@ -1,4 +1,5 @@
 #include "http_server.h"
+#include "web_api.h"
 #include "workspace.h"
 #include "agent_run.h"
 #include "ai_loop.h"
@@ -21,22 +22,15 @@
  * The web API. Each route calls EXACTLY the same functions as the CLI - we do
  * not duplicate logic. The web is just another "front-end" over the same core.
  *
- * Routes:
- *   GET  /                       -> the frontend (HTML)
- *   GET  /api/workspaces         -> the list of workspaces
- *   POST /api/workspaces         -> creates a workspace    {name}
- *   GET  /api/agents?ws=X        -> the agents in a workspace
- *   POST /api/agents             -> creates an agent       {ws, id, type, ...}
- *   POST /api/chat               -> sends a message        {ws, agent, message}
- *   GET  /api/history?ws=X&agent=Y -> the conversation history
- *   POST /api/history/reset      -> clears the history     {ws, agent}
- *   GET  /api/flows              -> the .flow files in examples/
- *   POST /api/flow/run           -> runs a graph           {ws, flow, task}
- *   POST /api/flow/diagram       -> Mermaid diagram        {flow}
- *   POST /api/flows              -> saves a graph          {name, content}
+ * The routes are listed once, in the table at the end of this file, and
+ * documented in docs/API.md - the written contract. tests/t_api_contract.c
+ * keeps the two in step.
  */
 
 #define BASE_DIR "workspaces"
+
+/* Maximum size of GET /api/jobs/{id}/data-edit-source (see that route). */
+#define DATA_EDIT_SOURCE_MAX HTTP_MAX_BODY_CEILING
 
 extern const char *WEB_INDEX_HTML;   /* in web_assets.c */
 
@@ -718,6 +712,25 @@ static void route_job_data_edit_source(const http_req_t *req, http_res_t *res) {
     fseek(f, 0, SEEK_SET);
     if (size < 0) { fclose(f); http_res_error(res, 500, "cannot read the source file"); return; }
 
+    /*
+     * The contract gives every route a maximum, and this one used to have
+     * none: a client (the UI now, pixelgo-ops later) would receive whatever
+     * size the file had. The cap is HTTP_MAX_BODY_CEILING, the largest body
+     * the server accepts back - an edited text bigger than that could not be
+     * returned through POST .../data-edit anyway, so showing it would be
+     * pointless. Checked before allocating, so an oversized file costs
+     * nothing.
+     */
+    if ((unsigned long)size > DATA_EDIT_SOURCE_MAX) {
+        fclose(f);
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "the request is too large to display (%ld bytes, maximum %d)",
+                 size, DATA_EDIT_SOURCE_MAX);
+        http_res_error(res, 500, msg);
+        return;
+    }
+
     char *buf = malloc((size_t)size + 1);
     if (!buf) { fclose(f); http_res_error(res, 500, "out of memory"); return; }
 
@@ -726,11 +739,11 @@ static void route_job_data_edit_source(const http_req_t *req, http_res_t *res) {
     buf[got] = 0;
 
     http_res_static(res, 200, "text/plain; charset=utf-8", buf, got);
-    /* http_res_static does not copy - it takes ownership of buf and frees it
-       once the response is sent (same contract used for WEB_INDEX_HTML,
-       except that one is static/never freed; a heap buffer here is fine
-       since http_res_static's documented contract is "does not copy", not
-       "never frees" - the response layer owns it after this call). */
+    /* http_res_static does not copy and marks the body as static, which is
+       right for WEB_INDEX_HTML but not for this heap buffer: without the flag
+       below it was never freed. Marking it heap hands ownership to the
+       response layer, which frees it after sending. */
+    res->body_is_heap = 1;
 }
 
 /*
@@ -979,73 +992,122 @@ static void route_limits(http_res_t *res) {
     http_res_json(res, 200, json);
 }
 
+/* --- the route table --- */
+
+/* Adapters for the routes whose handlers take no request. */
+static void route_index(const http_req_t *req, http_res_t *res) {
+    (void)req;
+    http_res_static(res, 200, "text/html; charset=utf-8",
+                    WEB_INDEX_HTML, strlen(WEB_INDEX_HTML));
+}
+static void route_workspaces_list_r(const http_req_t *req, http_res_t *res) {
+    (void)req; route_workspaces_list(res);
+}
+static void route_flows_list_r(const http_req_t *req, http_res_t *res) {
+    (void)req; route_flows_list(res);
+}
+static void route_limits_r(const http_req_t *req, http_res_t *res) {
+    (void)req; route_limits(res);
+}
+
+#define CT_JSON "application/json; charset=utf-8"
+#define CT_HTML "text/html; charset=utf-8"
+#define CT_TEXT "text/plain; charset=utf-8"
+
+/*
+ * Every route, once. The maximum sizes are not guesses: each JSON route
+ * already serializes into a fixed buffer, and the number here is that buffer
+ * (or a small ceiling for routes that only ever answer {"ok":true} or an
+ * error, whose body is at most ~1.2KB - see http_res_error). The two routes
+ * that had no bound are bounded here: the UI page, and data-edit-source.
+ * Keep this table and docs/API.md in step - t_api_contract checks it.
+ */
+#define SMALL 4096
+static const web_route_t ROUTES[] = {
+    { "GET",  "/",                               CT_HTML, 1048576,              route_index },
+    { "GET",  "/index.html",                     CT_HTML, 1048576,              route_index },
+    { "GET",  "/api/workspaces",                 CT_JSON, 16384,                route_workspaces_list_r },
+    { "POST", "/api/workspaces",                 CT_JSON, SMALL,                route_workspace_create },
+    { "GET",  "/api/agents",                     CT_JSON, 32768,                route_agents_list },
+    { "POST", "/api/agents",                     CT_JSON, SMALL,                route_agent_create },
+    { "POST", "/api/chat",                       CT_JSON, SMALL,                route_chat },
+    { "GET",  "/api/history",                    CT_JSON, 131072,               route_history_get },
+    { "POST", "/api/history/reset",              CT_JSON, SMALL,                route_history_reset },
+    { "GET",  "/api/limits",                     CT_JSON, SMALL,                route_limits_r },
+    { "GET",  "/api/flows",                      CT_JSON, 8192,                 route_flows_list_r },
+    { "POST", "/api/flows",                      CT_JSON, SMALL,                route_flow_save },
+    { "POST", "/api/flow/diagram",               CT_JSON, 16384,                route_flow_diagram },
+    { "POST", "/api/flow/graph",                 CT_JSON, 32768,                route_flow_graph },
+    { "POST", "/api/flow/run",                   CT_JSON, SMALL,                route_flow_run },
+    { "GET",  "/api/jobs/{id}",                  CT_JSON, JOB_RESULT_MAX + 2048, route_job_get },
+    { "GET",  "/api/jobs/{id}/events",           CT_JSON, 131072,               route_job_events },
+    { "GET",  "/api/jobs/{id}/data-edit-source", CT_TEXT, DATA_EDIT_SOURCE_MAX, route_job_data_edit_source },
+    { "POST", "/api/jobs/{id}/approve",          CT_JSON, SMALL,                route_job_approve },
+    { "POST", "/api/jobs/{id}/data-edit",        CT_JSON, SMALL,                route_job_data_edit_decision },
+};
+#undef SMALL
+
+const web_route_t *web_routes(size_t *count) {
+    if (count) *count = sizeof(ROUTES) / sizeof(ROUTES[0]);
+    return ROUTES;
+}
+
+/*
+ * Matches a path against a pattern. Literal characters must match exactly;
+ * "{id}" matches one job id: 1 to JOB_ID_LEN-1 letters or digits (generated
+ * ids are hex). Nothing else is accepted - no prefixes, no trailing parts, no
+ * '/' or '.' inside the id - so "/api/jobs/abc/events-anything" matches no
+ * route at all.
+ */
+static int path_matches(const char *pattern, const char *path) {
+    const char *p = pattern, *s = path;
+    while (*p) {
+        if (strncmp(p, "{id}", 4) == 0) {
+            size_t n = 0;
+            while ((s[n] >= '0' && s[n] <= '9') || (s[n] >= 'a' && s[n] <= 'z') ||
+                   (s[n] >= 'A' && s[n] <= 'Z'))
+                n++;
+            if (n == 0 || n >= JOB_ID_LEN) return 0;
+            s += n;
+            p += 4;
+            continue;
+        }
+        if (*p != *s) return 0;
+        p++; s++;
+    }
+    return *s == 0;
+}
+
 void web_handler(const http_req_t *req, http_res_t *res) {
-    int is_get  = strcmp(req->method, "GET") == 0;
-    int is_post = strcmp(req->method, "POST") == 0;
+    size_t n;
+    const web_route_t *routes = web_routes(&n);
+    int path_known = 0;
 
-    /* frontend */
-    if (is_get && (strcmp(req->path, "/") == 0 || strcmp(req->path, "/index.html") == 0)) {
-        http_res_static(res, 200, "text/html; charset=utf-8",
-                        WEB_INDEX_HTML, strlen(WEB_INDEX_HTML));
+    for (size_t i = 0; i < n; i++) {
+        if (!path_matches(routes[i].pattern, req->path)) continue;
+        path_known = 1;
+        if (strcmp(routes[i].method, req->method) != 0) continue;
+
+        routes[i].fn(req, res);
+
+        /*
+         * The contract's size cap, enforced for every route in one place. The
+         * handlers are already bounded, so this should never fire; if a
+         * future change breaks that, the client gets a clear error instead of
+         * a body larger than the contract promised.
+         */
+        if (res->body_len > routes[i].max_bytes) {
+            LOG_E("web: %s %s produced %zu bytes, over its contract maximum of %zu",
+                  req->method, routes[i].pattern, res->body_len, routes[i].max_bytes);
+            if (res->body_is_heap && res->body) free(res->body);
+            res->body = NULL;
+            res->body_len = 0;
+            res->body_is_heap = 0;
+            http_res_error(res, 500, "response exceeds the contract maximum");
+        }
         return;
     }
 
-    /* API */
-    if (strcmp(req->path, "/api/workspaces") == 0) {
-        if (is_get)  { route_workspaces_list(res); return; }
-        if (is_post) { route_workspace_create(req, res); return; }
-        http_res_error(res, 405, "method not allowed");
-        return;
-    }
-    if (strcmp(req->path, "/api/agents") == 0) {
-        if (is_get)  { route_agents_list(req, res); return; }
-        if (is_post) { route_agent_create(req, res); return; }
-        http_res_error(res, 405, "method not allowed");
-        return;
-    }
-    if (is_post && strcmp(req->path, "/api/chat") == 0) {
-        route_chat(req, res); return;
-    }
-    if (is_get && strcmp(req->path, "/api/history") == 0) {
-        route_history_get(req, res); return;
-    }
-    if (is_get && strcmp(req->path, "/api/limits") == 0) {
-        route_limits(res); return;
-    }
-    if (is_post && strcmp(req->path, "/api/history/reset") == 0) {
-        route_history_reset(req, res); return;
-    }
-    if (is_get && strcmp(req->path, "/api/flows") == 0) {
-        route_flows_list(res); return;
-    }
-    if (is_post && strcmp(req->path, "/api/flow/diagram") == 0) {
-        route_flow_diagram(req, res); return;
-    }
-    if (is_post && strcmp(req->path, "/api/flow/run") == 0) {
-        route_flow_run(req, res); return;
-    }
-    if (is_get && strncmp(req->path, "/api/jobs/", 10) == 0) {
-        /* More specific suffixes take priority over the bare /api/jobs/<id> */
-        if (strstr(req->path, "/events")) { route_job_events(req, res); return; }
-        if (strstr(req->path, "/data-edit-source")) { route_job_data_edit_source(req, res); return; }
-        route_job_get(req, res); return;
-    }
-    if (is_post && strcmp(req->path, "/api/flow/graph") == 0) {
-        route_flow_graph(req, res); return;
-    }
-    if (is_post && strcmp(req->path, "/api/flows") == 0) {
-        route_flow_save(req, res); return;
-    }
-    if (is_post && strncmp(req->path, "/api/jobs/", 10) == 0 &&
-        strstr(req->path, "/data-edit")) {
-        /* Checked before /approve below: "/data-edit" is a distinct,
-           longer suffix and must not be shadowed by a looser match. */
-        route_job_data_edit_decision(req, res); return;
-    }
-    if (is_post && strncmp(req->path, "/api/jobs/", 10) == 0 &&
-        strstr(req->path, "/approve")) {
-        route_job_approve(req, res); return;
-    }
-
-    http_res_error(res, 404, "no such route");
+    if (path_known) http_res_error(res, 405, "method not allowed");
+    else            http_res_error(res, 404, "no such route");
 }
