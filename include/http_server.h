@@ -45,10 +45,18 @@
 #define HTTP_MAX_BODY_DEFAULT 65536
 #define HTTP_MAX_BODY_CEILING (4 * 1024 * 1024)
 
+/* Host and Origin header values. 256 is generous for the names we accept
+   (localhost, 127.0.0.1, or whatever PIXELGO_ALLOWED_HOSTS names) and keeps
+   http_req_t small enough to stay a stack local in http_serve's child. A
+   longer value is truncated, which can only make the check fail - never pass. */
+#define HTTP_MAX_HOST 256
+
 typedef struct {
     char method[8];               /* "GET" | "POST"                     */
     char path[HTTP_MAX_PATH];     /* "/api/agents" (without query string) */
     char query[HTTP_MAX_PATH];    /* what comes after '?', may be empty */
+    char host[HTTP_MAX_HOST];     /* Host header, "" if absent          */
+    char origin[HTTP_MAX_HOST];   /* Origin header, "" if absent        */
     char *body;                   /* the request body (JSON on POST) -
                                       NOT owned by the caller, do not free */
     size_t body_len;
@@ -69,6 +77,35 @@ typedef void (*http_handler_fn)(const http_req_t *req, http_res_t *res);
 /* Starts the server on the given port. Infinite loop (blocks).
    Returns -1 only if it cannot open the socket. */
 int http_serve(int port, http_handler_fn handler);
+
+/*
+ * Is this request allowed to reach a handler at all?
+ *
+ * A browser sends requests to localhost on behalf of ANY page the user has
+ * open. Without this check two things work with no bug in the browser and
+ * nothing installed on the machine:
+ *
+ *   - any page can POST to http://localhost:<port>/api/... and start a flow,
+ *     create an agent with run_command, or approve a pending tool call. It
+ *     does not need to read the answer for the damage to be done.
+ *   - a site can make its own hostname resolve to 127.0.0.1 (DNS rebinding)
+ *     and then read the answers too, because the browser treats that as
+ *     same-origin with itself.
+ *
+ * So: Host must name us, which is what defeats rebinding - the rebinding
+ * site's requests carry its own hostname. And for a state-changing method,
+ * Origin must either be absent (curl, a script - not a browser acting for a
+ * third party) or name us as well.
+ *
+ * The accepted names are localhost and 127.0.0.1, plus anything listed in
+ * PIXELGO_ALLOWED_HOSTS (comma-separated, no port) - needed when PIXELGO_BIND
+ * puts the server behind a container port mapping or a reverse proxy, where
+ * the Host the client uses is not one we can guess.
+ *
+ * This is NOT authentication: it stops other web pages, not other local
+ * processes. Returns 1 to allow, 0 to refuse with 403.
+ */
+int http_origin_allowed(const http_req_t *req, int port);
 
 /* Helpers for handlers: set the response.
    http_res_json copies the given text (heap). http_res_static does not copy. */
