@@ -571,7 +571,7 @@ $$('.tab').forEach(t => t.onclick = () => {
 /* ---------- workspaces ---------- */
 async function loadWorkspaces() {
   const list = await api('/api/workspaces');
-  const opts = list.map(w => `<option value="${w.name}">${w.name} (${w.agent_count})</option>`).join('');
+  const opts = list.map(w => `<option value="${esc(w.name)}">${esc(w.name)} (${num(w.agent_count)})</option>`).join('');
   ['#ws-select', '#ag-ws', '#fl-ws'].forEach(sel => {
     const el = $(sel);
     const cur = el.value;
@@ -620,9 +620,9 @@ async function loadChatAgents() {
     return;
   }
   box.innerHTML = ai.map(a => `
-    <div class="item ${state.agent === a.id ? 'active' : ''}" data-id="${a.id}">
-      ${a.id}
-      <div class="meta">${a.provider} · ${a.model}${a.tools.length ? ' · ' + a.tools.length + ' tool-uri' : ''}</div>
+    <div class="item ${state.agent === a.id ? 'active' : ''}" data-id="${esc(a.id)}">
+      ${esc(a.id)}
+      <div class="meta">${esc(a.provider)} · ${esc(a.model)}${alen(a.tools) ? ' · ' + alen(a.tools) + ' tool-uri' : ''}</div>
     </div>`).join('');
   box.querySelectorAll('.item').forEach(el => el.onclick = () => selectAgent(el.dataset.id));
 }
@@ -662,10 +662,30 @@ function renderMessages(msgs) {
   box.scrollTop = box.scrollHeight;
 }
 
+/* Escapes a value for HTML. Quotes are escaped too, because esc() is used
+   inside attributes as well as in text: without that, a value containing a
+   quote closes the attribute and can add an event handler.
+   Every value that comes from the API goes through this, including ones
+   that "should" be numbers - see num(). */
 function esc(s) {
   return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+
+/* Coerces an API value that is supposed to be a number. A field the server
+   declares as a number can still arrive as a string - from a stale build,
+   or, in isolated mode, from an engine the host does not control - and
+   interpolating it directly would drop that string straight into the page.
+   Returns `fallback` for anything that is not a finite number. */
+function num(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/* Length of something the API said was an array, without throwing when it
+   is not one. */
+function alen(v) { return Array.isArray(v) ? v.length : 0; }
 
 async function loadHistory() {
   if (!state.ws || !state.agent) return;
@@ -806,12 +826,12 @@ async function loadAgentList() {
   if (!agents.length) { $('#agent-list').innerHTML = '<div class="hint">No agents.</div>'; return; }
   $('#agent-list').innerHTML = agents.map(a => `
     <div class="item">
-      <b>${esc(a.id)}</b> <span class="badge">${a.type}</span>
-      ${a.approval && a.approval.length
+      <b>${esc(a.id)}</b> <span class="badge">${esc(a.type)}</span>
+      ${alen(a.approval)
         ? `<span class="badge" title="asks before: ${esc(a.approval.join(', '))}">needs approval</span>`
         : ''}
       <div class="meta">${a.type === 'ai'
-        ? esc(a.provider + ' · ' + a.model) + (a.tools.length ? ' · tools: ' + a.tools.join(', ') : ' · no tools')
+        ? esc(a.provider + ' · ' + a.model) + (alen(a.tools) ? ' · tools: ' + esc(a.tools.join(', ')) : ' · no tools')
         : esc(a.command)}</div>
     </div>`).join('');
 }
@@ -994,7 +1014,7 @@ function logLine(kind, time, who, what) {
   const div = document.createElement('div');
   div.className = 'lg ' + kind;
   div.innerHTML =
-    `<span class="t">${(time/1000).toFixed(1)}s</span>` +
+    `<span class="t">${(num(time)/1000).toFixed(1)}s</span>` +
     `<span class="who">${esc(who)}</span>` +
     `<span class="what">${esc(what)}</span>`;
   box.appendChild(div);
@@ -1333,7 +1353,7 @@ async function streamEvents(jobId) {
 async function loadFlows() {
   const flows = await api('/api/flows');
   $('#flow-list').innerHTML = flows.length
-    ? flows.map(f => `<div class="item" data-f="${f}">${f.replace('examples/', '')}</div>`).join('')
+    ? flows.map(f => `<div class="item" data-f="${esc(f)}">${esc(String(f ?? '').replace('examples/', ''))}</div>`).join('')
     : '<div class="hint">No .flow files yet</div>';
   $$('#flow-list .item').forEach(el => el.onclick = () => selectFlow(el.dataset.f));
 }
@@ -1425,20 +1445,23 @@ $('#run-flow').onclick = async () => {
     });
 
     const outs = j.outputs || [];
-    const usd = m => '$' + (m / 1e6).toFixed((m > 0 && m < 10000) ? 4 : 2);
+    // num() on the way in, so a field that arrives as a string becomes a
+    // number here rather than reaching the page as text.
+    const usd = v => { const m = num(v); return '$' + (m / 1e6).toFixed((m > 0 && m < 10000) ? 4 : 2); };
 
     // Cost summary - this is the demonstration: what it REALLY cost vs everything on the expensive model
     let summary = '';
-    const totalCost = j.total_cost_micro_usd || 0;
+    const totalCost = num(j.total_cost_micro_usd);
     if (totalCost > 0) {
       // the most expensive model used (by output cost/token)
       let worst = null, worstRate = 0;
       outs.forEach(o => {
-        if (!o.output_tokens || !o.cost_micro_usd) return;
-        const rate = o.cost_micro_usd / (o.input_tokens + o.output_tokens || 1);
+        const out = num(o.output_tokens), cost = num(o.cost_micro_usd);
+        if (!out || !cost) return;
+        const rate = cost / (num(o.input_tokens) + out || 1);
         if (rate > worstRate) { worstRate = rate; worst = o.model; }
       });
-      const totalTok = (j.total_input_tokens || 0) + (j.total_output_tokens || 0);
+      const totalTok = num(j.total_input_tokens) + num(j.total_output_tokens);
       const alt = worstRate * totalTok;
       const saved = alt - totalCost;
       const pct = alt > 0 ? Math.round(100 - (totalCost * 100 / alt)) : 0;
@@ -1455,7 +1478,7 @@ $('#run-flow').onclick = async () => {
     $('#flow-outputs').innerHTML = summary + (outs.length
       ? outs.map(o => {
           const meta = o.model
-            ? `<div class="node-cost">${esc(o.model)} · ${o.input_tokens||0} in · ${o.output_tokens||0} out · ${usd(o.cost_micro_usd||0)}</div>`
+            ? `<div class="node-cost">${esc(o.model)} · ${num(o.input_tokens)} in · ${num(o.output_tokens)} out · ${usd(o.cost_micro_usd)}</div>`
             : '';
           return `<div class="row"><label>${esc(o.node)}</label>${meta}<pre>${esc(o.output || '(no output)')}</pre></div>`;
         }).join('')

@@ -399,18 +399,48 @@ static void send_all(int fd, const char *data, size_t len) {
     }
 }
 
+/*
+ * Content-Security-Policy: the net under the UI's escaping.
+ *
+ * The page loads nothing from anywhere - one inline <script>, no inline
+ * on*="..." handlers, no external stylesheet, font or image - so everything
+ * can be denied by default. What each directive buys:
+ *
+ *   default-src 'none'   nothing loads unless named below
+ *   connect-src 'self'   fetch/XHR only back to us. This is the important
+ *                        one: a string that did slip past escaping could
+ *                        still not send what it read anywhere.
+ *   img-src 'self' data: the graph's inline SVG and data: URIs
+ *   base-uri / form-action 'none'   no base-tag hijack, no form posted away
+ *   frame-ancestors 'none'          no clickjacking
+ *
+ * script-src is 'unsafe-inline' because the page's own script is inline and
+ * has no nonce yet. That does not stop injected inline script from running -
+ * escaping is what does - but with connect-src above, such a script has
+ * nowhere to send anything. Giving the script a per-response nonce, which
+ * would block injected script outright, is a separate change.
+ */
+#define CSP_HEADER \
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " \
+    "img-src 'self' data:; connect-src 'self'; base-uri 'none'; " \
+    "form-action 'none'; frame-ancestors 'none'"
+
 static void send_response(int fd, const http_res_t *res) {
-    char header[512];
+    char header[1024];
     int n = snprintf(header, sizeof(header),
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "Cache-Control: no-store\r\n"
+        "Content-Security-Policy: %s\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "Referrer-Policy: no-referrer\r\n"
         "\r\n",
         res->status, status_text(res->status),
         res->content_type ? res->content_type : "text/plain",
-        res->body_len);
+        res->body_len,
+        CSP_HEADER);
 
     if (n > 0) send_all(fd, header, (size_t)n);
     if (res->body && res->body_len > 0) send_all(fd, res->body, res->body_len);
