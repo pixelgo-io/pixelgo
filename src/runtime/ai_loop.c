@@ -374,10 +374,10 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
         return -1;
     }
 
-    /* We trim the old messages if the history has grown too much - otherwise we
-       exceed the model's context limit and the API errors out. */
-    if (persist_history)
-        history_trim(messages, HISTORY_MAX_MESSAGES);
+    /* No trimming here any more: history_compact() runs at the top of every
+       iteration, including the first, so a history loaded from disk is
+       measured together with the task that is about to be added - and
+       measured in tokens rather than counted in messages. */
 
     history_add_user_text(messages, effective_task);
 
@@ -398,12 +398,29 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
 
     const int max_iterations = ai_loop_max_iterations();
 
+    /* One retry, once per run: if compacting hard did not help either, the
+       problem is not the history and looping would only burn iterations. */
+    int length_retry_done = 0;
+
     for (int iter = 0; iter < max_iterations; iter++) {
         LOG_I("ai_loop: agent=%s iteration=%d/%d -> call %s (%s)",
               agent->id, iter + 1, max_iterations,
               provider_to_string(agent->cfg.ai.provider), agent->cfg.ai.model);
 
         event_agent_thinking(agent->id, iter + 1);
+
+        /*
+         * Keep the request inside the model's window.
+         *
+         * Checked before EVERY call, not once before the loop: this loop can
+         * add up to AI_LOOP_MAX_ITERATIONS assistant turns and as many tool
+         * results, so a history that was comfortable at the start can be far
+         * past the window by the end. history_compact() only acts when the
+         * high-water mark is passed, and then cuts all the way to the low one,
+         * so it runs often and changes the history rarely - which is what
+         * keeps the prompt cache alive.
+         */
+        history_compact(agent, messages, 0);
 
         /*
          * Data Request Approval Gateway.
@@ -571,7 +588,38 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
            Anthropic, OpenAI or Gemini is underneath. The response arrives already
            NORMALIZED in the neutral format (content[] with text/tool_use blocks). */
         provider_response_t presp;
+
+        /* Measured before the call, used after it: dividing this by the
+           input_tokens the provider reports is what teaches the estimator
+           the real bytes-per-token ratio for this content and this model,
+           instead of guessing it. */
+        size_t request_bytes = 0;
+        {
+            char *req_json = cJSON_PrintUnformatted(messages);
+            if (req_json) {
+                request_bytes = strlen(agent->cfg.ai.system_prompt) + strlen(req_json);
+                free(req_json);
+            }
+        }
+
         if (provider_call(agent, messages, tools, &presp) != 0) {
+            /*
+             * A length rejection means the estimate was wrong - the budget is
+             * the defence, this is the net under it. Compact hard and try once
+             * more rather than losing everything the run has done so far.
+             *
+             * Detected from the provider's message, which is a heuristic: the
+             * three APIs word it differently and may reword it again. Getting
+             * it wrong costs one wasted iteration, never a wrong answer.
+             */
+            if (!length_retry_done && provider_error_is_too_long(presp.error)) {
+                LOG_W("ai_loop: the provider refused the request for length; "
+                      "compacting hard and retrying once");
+                length_retry_done = 1;
+                provider_response_free(&presp);
+                history_compact(agent, messages, 1);
+                continue;
+            }
             LOG_E("ai_loop: provider call failed: %.300s", presp.error);
             provider_response_free(&presp);
             break;
@@ -579,6 +627,9 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
 
         /* Add up the tokens for this turn. */
         usage_add(&total_usage, &presp.usage);
+
+        /* Now we know both halves: what we sent, and what it counted. */
+        history_calibrate(request_bytes, presp.usage.input_tokens);
 
         cJSON *content = presp.content;
         if (!cJSON_IsArray(content)) {

@@ -47,6 +47,24 @@ const char *provider_to_string(llm_provider_id_t id);
 /* The name of the environment variable holding the API key for the given provider. */
 const char *provider_env_key(llm_provider_id_t id);
 
+/*
+ * Does this error message mean "the request was too long"?
+ *
+ * A length rejection arrives as an ordinary 400 whose only distinguishing
+ * mark is the provider's own wording, and the three APIs word it
+ * differently - "prompt is too long", "maximum context length",
+ * "exceeds the maximum number of tokens". So this is a heuristic over known
+ * phrasings, not a protocol feature, and it may stop recognising a message
+ * the day a provider rewords one.
+ *
+ * It is used only to decide whether to compact the history and try once
+ * more. A false negative costs the run as it would have been lost anyway;
+ * a false positive costs one wasted iteration. Neither can produce a wrong
+ * answer, which is why a heuristic is acceptable here and would not be in
+ * the budget itself.
+ */
+int provider_error_is_too_long(const char *error);
+
 /* The result of a call, already NORMALIZED to the neutral format.
    content is a cJSON array owned by the caller (must be cJSON_Delete()d). */
 typedef struct {

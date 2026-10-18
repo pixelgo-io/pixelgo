@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasestr - <strings.h> on macOS, a target platform */
 #include <time.h>
 
 #define DEFAULT_TIMEOUT_SEC 120L
@@ -145,4 +146,27 @@ void provider_response_free(provider_response_t *resp) {
         cJSON_Delete(resp->content);
         resp->content = NULL;
     }
+}
+
+/* See the doc comment in provider.h: a heuristic over how the three APIs
+   word a length rejection, used only to decide whether compacting and
+   retrying is worth one iteration. */
+int provider_error_is_too_long(const char *error) {
+    if (!error || !error[0]) return 0;
+
+    static const char *marks[] = {
+        "prompt is too long",              /* Anthropic                    */
+        "maximum context length",          /* OpenAI                       */
+        "context_length_exceeded",         /* OpenAI, error code           */
+        "exceeds the maximum number of tokens",
+        "input token count",               /* Gemini                       */
+        "too many tokens",
+        "request too large",
+        "token limit",
+        NULL
+    };
+
+    for (int i = 0; marks[i]; i++)
+        if (strcasestr(error, marks[i])) return 1;
+    return 0;
 }
