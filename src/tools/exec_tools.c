@@ -2,6 +2,7 @@
 #include "sandbox.h"
 #include "json_util.h"
 #include "log.h"
+#include "confine.h"
 #include "events.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -257,11 +258,27 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
          *   "cc1: fatal error: src/calc.c: No such file or directory"
          *
          * Correct: we do NOT chdir at all. The child inherits the parent's cwd,
-         * which is already the correct working directory (shared/). The sandbox
-         * remains ensured by the allowlist + by the fact that the agent cannot
-         * escape the allowed roots through the file tools.
+         * which is already the correct working directory (shared/).
          */
-        (void)agent;   /* we no longer need agent->dir here */
+
+        /*
+         * Confine the child before it becomes somebody else's program.
+         *
+         * This is the only place it can be done. The restriction cannot be
+         * undone and is inherited by every descendant, so it must happen
+         * after fork - never in the parent, which has to keep serving other
+         * agents - and before exec, after which we no longer control what
+         * runs.
+         *
+         * Being inherited is the point: a confined `make` can spawn `gcc`,
+         * and neither of them escapes. See confine.h for why the allowlist
+         * was never going to be enough on its own.
+         */
+        if (confine_apply(agent) != 0) {
+            fprintf(stderr, "refusing to run '%s': the child could not be "
+                            "confined and PIXELGO_CONFINE=require\n", cmd);
+            _exit(126);
+        }
 
         /* NO SHELL: execvp receives the arguments as a vector, so the shell
            metacharacters (";", "|", "$()") are just text, not operators. */
