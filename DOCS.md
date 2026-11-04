@@ -539,7 +539,60 @@ tells the model this explicitly.
 **3. Timeout.** Default 60s, configurable per call. On expiry: SIGTERM on the
 whole process group, then SIGKILL. No processes are left hanging.
 
-**4. Sandbox.** The command runs with `chdir` into the agent's directory.
+**4. Kernel confinement (Linux).** Before the child `exec`s, it is restricted
+with [Landlock](https://docs.kernel.org/userspace-api/landlock.html): it may
+read, write and create inside the agent's own directory, the workspace's
+shared directory and `/tmp`, may read and execute the paths a toolchain needs
+(`/usr`, `/lib`, `/etc`, …), and **nothing else at all**. The restriction
+cannot be undone and is inherited by every descendant, so a confined `make`
+can spawn `gcc` and neither of them escapes.
+
+This is the only real boundary here, and the reason it has to exist is that
+the allowlist above is not one. Every build tool runs arbitrary code by
+design — `make` runs what the Makefile says, `gradle` runs Groovy from
+`build.gradle`, `npm install` runs postinstall scripts, `cargo build` runs
+`build.rs` — and the agent writes those files. An allowlist of build tools
+stops typos and accidents; it does not stop an agent that was steered into
+reading your `.env`. Landlock does:
+
+```
+$ cat Makefile
+all:
+	cat ~/.env
+$ # the agent runs `make`, which is on its allowlist
+cat: /home/you/.env: Permission denied
+```
+
+Three modes, via `PIXELGO_CONFINE`:
+
+| value | behaviour |
+| --- | --- |
+| `try` | **default** — confine when the kernel supports it, warn loudly when it does not |
+| `require` | refuse to run the command at all if it cannot be confined |
+| `off` | do not confine |
+
+`try` is the default because confining where possible breaks nobody, while
+refusing to run would break every user on a kernel older than 5.13 the moment
+they upgraded. If you want the stronger promise, ask for it.
+
+A build whose toolchain lives outside the default paths — an Android SDK, a
+Rust toolchain in `~/.cargo`, a Gradle cache in `~/.gradle` — needs those
+granted explicitly, as a colon-separated list:
+
+```bash
+PIXELGO_CONFINE_READ=/usr:/lib:/etc:/opt/android-sdk:$HOME/.gradle ./pixelgo ...
+```
+
+Note that `$HOME` is deliberately **not** in the default set: it is where
+`.env`, `.ssh` and `.aws` live. Granting a cache under it means naming that
+one path, not opening the lot.
+
+**What this does not cover.** The filesystem only. A confined child can still
+open sockets, because most real builds fetch dependencies — and so could one
+that sends away what it read. Network confinement is a separate decision.
+And on macOS there is no Landlock: the equivalent is Seatbelt
+(`sandbox-exec`), which is not implemented yet, so a command there runs
+unconfined and says so in the log.
 
 **5. Truncated output** at 8 KB, so the model's context does not blow up.
 

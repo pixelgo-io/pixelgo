@@ -6,6 +6,7 @@ SRC = \
 	src/cli/main.c \
 	src/core/workspace.c \
 	src/core/sandbox.c \
+	src/core/confine.c \
 	src/core/agent_run.c \
 	src/core/flow.c \
 	src/core/orchestrator.c \
