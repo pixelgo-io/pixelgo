@@ -153,6 +153,98 @@ int flow_validate(const flow_graph_t *g, const void *ws_ptr) {
     return ok;
 }
 
+/* --- reading the verdict out of an agent's output --- */
+
+/* The first character of the line `p` points into. */
+static const char *line_start(const char *text, const char *p) {
+    while (p > text && p[-1] != '\n') p--;
+    return p;
+}
+
+/* Is everything between a and b whitespace? */
+static int blank_range(const char *a, const char *b) {
+    for (; a < b; a++)
+        if (*a != ' ' && *a != '\t' && *a != '\r') return 0;
+    return 1;
+}
+
+/* Is `line` (up to its newline or end) nothing but `marker` and whitespace? */
+static int line_is_marker(const char *line, const char *marker, size_t mlen) {
+    const char *end = strchr(line, '\n');
+    if (!end) end = line + strlen(line);
+
+    while (line < end && (*line == ' ' || *line == '\t')) line++;
+    if ((size_t)(end - line) < mlen) return 0;
+    if (strncmp(line, marker, mlen) != 0) return 0;
+
+    return blank_range(line + mlen, end);
+}
+
+int flow_verdict_matches(const char *output, const char *marker) {
+    if (!output || !marker || !marker[0]) return 0;
+
+    size_t mlen = strlen(marker);
+
+    /* the first non-empty line */
+    const char *p = output;
+    while (*p) {
+        const char *end = strchr(p, '\n');
+        if (!end) end = p + strlen(p);
+        if (!blank_range(p, end)) {
+            if (line_is_marker(p, marker, mlen)) return 1;
+            break;
+        }
+        if (!*end) break;
+        p = end + 1;
+    }
+
+    /* the last non-empty line */
+    size_t len = strlen(output);
+    const char *q = output + len;
+    while (q > output) {
+        const char *ls = line_start(output, q - 1);
+        const char *le = strchr(ls, '\n');
+        if (!le) le = output + len;
+        if (!blank_range(ls, le))
+            return line_is_marker(ls, marker, mlen);
+        if (ls == output) break;
+        q = ls;
+    }
+
+    return 0;
+}
+
+/*
+ * Called when no conditional edge matched, to say so out loud.
+ *
+ * This rule is stricter than the substring search it replaces, and that
+ * strictness has a failure mode: an agent that writes "APPROVED - all five
+ * bugs are fixed" on its first line used to route correctly, by accident,
+ * and now does not. Without this, that shows up as a graph quietly taking
+ * the fallback, which is the hardest kind of problem to find.
+ *
+ * So when a marker is present somewhere in the output but not as a verdict,
+ * the log says exactly that. The route does not change - a verdict buried in
+ * prose is still not a verdict - but the person reading the journal is told
+ * why, instead of being left to guess.
+ */
+static void warn_marker_not_a_verdict(const flow_graph_t *g, const char *from,
+                                      const char *output) {
+    if (!output || !output[0]) return;
+
+    for (int i = 0; i < g->edge_count; i++) {
+        const flow_edge_t *e = &g->edges[i];
+        if (strcmp(e->from, from) != 0 || !e->condition[0]) continue;
+        if (!strstr(output, e->condition)) continue;
+        if (flow_verdict_matches(output, e->condition)) continue;
+
+        LOG_W("flow: '%s' mentions '%s' but not as its verdict - the marker "
+              "must be alone on the first or the last line. Taking the "
+              "fallback instead.", from, e->condition);
+        return;   /* one line is the point; a list of them is noise */
+    }
+}
+
 int flow_next(const flow_graph_t *g, const char *from, const char *output,
               char out[MAX_STR]) {
     const char *fallback = NULL;
@@ -166,11 +258,15 @@ int flow_next(const flow_graph_t *g, const char *from, const char *output,
             if (!fallback) fallback = e->to; /* the first unconditional one */
             continue;
         }
-        if (output && strstr(output, e->condition)) {
+        if (flow_verdict_matches(output, e->condition)) {
             snprintf(out, MAX_STR, "%s", e->to);
             return 1;
         }
     }
+
+    /* No conditional edge matched. If a marker is in there but not as a
+       verdict, say so rather than letting the fallback look deliberate. */
+    warn_marker_not_a_verdict(g, from, output);
 
     if (fallback) {
         snprintf(out, MAX_STR, "%s", fallback);
@@ -182,6 +278,7 @@ int flow_next(const flow_graph_t *g, const char *from, const char *output,
 int flow_next_all(const flow_graph_t *g, const char *from, const char *output,
                   char out[][MAX_STR], int max_out) {
     int count = 0;
+    int conditional_matched = 0;
 
     /* We collect ALL applicable targets (we do not stop at the first, like
        flow_next). This is the difference that makes fan-out possible: if a node has
@@ -190,9 +287,12 @@ int flow_next_all(const flow_graph_t *g, const char *from, const char *output,
         const flow_edge_t *e = &g->edges[i];
         if (strcmp(e->from, from) != 0) continue;
 
-        /* conditional edge: only if the marker is in the output */
-        if (e->condition[0] && !(output && strstr(output, e->condition)))
-            continue;
+        /* conditional edge: only if the output DECLARES the marker as its
+           verdict (see flow_verdict_matches) */
+        if (e->condition[0]) {
+            if (!flow_verdict_matches(output, e->condition)) continue;
+            conditional_matched = 1;
+        }
 
         /* we avoid duplicates (the same target on two edges) */
         int dup = 0;
@@ -202,6 +302,10 @@ int flow_next_all(const flow_graph_t *g, const char *from, const char *output,
 
         snprintf(out[count++], MAX_STR, "%s", e->to);
     }
+
+    if (!conditional_matched)
+        warn_marker_not_a_verdict(g, from, output);
+
     return count;
 }
 

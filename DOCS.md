@@ -169,22 +169,60 @@ edge reviewer -> END   when APPROVED    # END = termination
 **`edge A -> B`** — unconditional transition: after A finishes, B runs.
 
 **`edge A -> B when MARKER`** — conditional transition: B runs only if A's output
-**contains** the substring `MARKER`.
+**declares** `MARKER` as its verdict — the marker alone on its own line, either
+the first non-empty line of the output or the last. See "How conditions work".
 
 **`END`** — a special node. When it is reached, the graph ends.
 
 ### How conditions work
 
-An agent signals its decision by writing a marker in its final response. For
-example, you give the reviewer a system prompt like:
+An agent signals its decision by putting a marker **on a line of its own** —
+the first non-empty line of its response, or the last. Nothing else may be on
+that line. So you give the reviewer a system prompt like:
 
-> "Check the code. If you find problems, respond with details and end with the
-> word NEEDS_FIX. If it is fine, end with the word APPROVED."
+> "Check the code. Begin your response with the verdict on the first line,
+> alone and in uppercase: NEEDS_FIX if there are still serious problems,
+> APPROVED if they are fixed. Only after that, write the explanation."
 
-The orchestrator looks for the marker in the output and picks the matching edge.
+and a correct response looks like:
+
+```
+NEEDS_FIX
+
+src/calc.c:18 — add_history() does not check h->count against MAX_HISTORY,
+so the eleventh entry writes past the array.
+```
+
+**Why a line and not a substring.** Because an agent reviewing code quotes the
+code it is reviewing. A file containing the words `NEEDS_FIX` anywhere — a
+comment, a test fixture, a string literal — would put them in the agent's
+output, and the graph would follow a verdict nobody gave. The same happens
+when an agent explains itself: *"APPROVED … I would have said NEEDS_FIX if the
+overflow were still there"* contains both markers, and a substring search would
+let their order in the `.flow` file decide, rather than what the agent meant.
+
+Matching is case-sensitive, so a lowercase `approved` in prose does not count.
+Leading and trailing whitespace on the line is ignored, and a `\r` is tolerated.
+
+**If a marker is present but not as a verdict**, the log says so:
+
+```
+[WARN ] flow: 'reviewer' mentions 'NEEDS_FIX' but not as its verdict - the
+        marker must be alone on the first or the last line. Taking the
+        fallback instead.
+```
+
+The route does not change — a verdict buried in prose is still not a verdict —
+but you are told why the graph went where it did, instead of having to guess.
 
 **Evaluation order:** conditional edges first (the first match wins), then the
 unconditional ones as a fallback.
+
+**What this does not protect against:** an agent that was *persuaded* — by a
+page it read, by a file it was given — to write the marker on its own first
+line. Nothing in the graph layer can tell that apart from a real verdict.
+Reducing that risk is a matter of marking untrusted tool output as data rather
+than instructions, which is tracked separately.
 
 ### FAN-OUT: parallelism
 

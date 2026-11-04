@@ -5,8 +5,10 @@
 
 # Build artifacts
 *.o
+*.d
 pixelgo
 src/web/web_assets.c
+tests/run_*
 
 # Runtime data
 workspaces/
