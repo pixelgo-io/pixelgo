@@ -20,7 +20,9 @@
 #define FLOW_END "END"           /* sentinel node: stops the orchestration */
 
 /* An edge: from `from` to `to`. If `condition[0]` != 0, the edge is chosen
-   ONLY if the output of agent `from` contains that marker (substring).
+   ONLY if the output of agent `from` DECLARES that marker as its verdict -
+   see flow_verdict_matches() for what that means and why it is not a
+   substring search.
    Unconditional edges (empty condition) are the "fallback" - they are chosen if
    no conditional one matched. */
 typedef struct {
@@ -48,8 +50,41 @@ int flow_load(flow_graph_t *g, const char *path);
 struct workspace_t; /* fwd */
 int flow_validate(const flow_graph_t *g, const void *ws);
 
+/*
+ * Does `output` declare `marker` as its verdict?
+ *
+ * The marker has to be a LINE OF ITS OWN - the first non-empty line of the
+ * output, or the last - with nothing on that line but the marker and
+ * whitespace. It is not a substring search, and the difference is the whole
+ * point of this function.
+ *
+ * What a substring search does wrong: an agent reviewing code quotes the code
+ * it is reviewing. A file containing the words `NEEDS_FIX` anywhere - a
+ * comment, a test fixture, a string literal - puts them in the agent's output,
+ * and the graph then follows a verdict nobody gave. The same happens when an
+ * agent explains itself: "APPROVED ... I would have said NEEDS_FIX if the
+ * overflow were still there" contains both markers, and which edge wins is
+ * decided by their order in the .flow file rather than by what the agent
+ * meant.
+ *
+ * Why the first line OR the last: putting the verdict on its own first line
+ * is the convention the agents are asked to follow, and repeating it at the
+ * end is a habit models have anyway. Accepting both means the repetition is
+ * harmless rather than load-bearing.
+ *
+ * Case-sensitive, because the markers are uppercase by convention and a
+ * lowercase `approved` in prose must not count.
+ *
+ * What this does NOT protect against: an agent that was persuaded - by a
+ * page it read, by a file it was given - to write the marker on its own
+ * first line. Nothing here can tell that apart from a real verdict. That is
+ * what delimiting untrusted tool output is for.
+ */
+int flow_verdict_matches(const char *output, const char *marker);
+
 /* Picks the next node after `from` produced `output`. Applies the rule:
-   1. the first conditional edge whose condition is in the output wins;
+   1. the first conditional edge whose marker the output declares as its
+      verdict wins (see flow_verdict_matches);
    2. otherwise, the first unconditional edge from `from`.
    Writes the target id into out (may be FLOW_END). Returns 1 if a transition
    was found, 0 if `from` has no applicable edge (dead end). */

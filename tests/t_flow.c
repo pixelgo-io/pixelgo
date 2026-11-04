@@ -102,16 +102,28 @@ int main(void) {
             "edge reviewer -> coder when NEEDS_FIX\n"
             "edge reviewer -> END   when APPROVED\n"));
 
-        int n = flow_next_all(&g, "reviewer", "...NEEDS_FIX...", out, FLOW_MAX_NODES);
-        eq_int("one target when the marker matches", n, 1);
+        /* The verdict is a line of its own - see flow_verdict_matches(). */
+        int n = flow_next_all(&g, "reviewer",
+                              "NEEDS_FIX\n\nthe overflow is still unchecked\n",
+                              out, FLOW_MAX_NODES);
+        eq_int("one target when the output declares the marker", n, 1);
         eq_str("and it is the right one", out[0], "coder");
 
-        n = flow_next_all(&g, "reviewer", "all good, APPROVED", out, FLOW_MAX_NODES);
+        n = flow_next_all(&g, "reviewer", "APPROVED\n\nall good\n",
+                          out, FLOW_MAX_NODES);
         eq_int("the other marker", n, 1);
         eq_str("goes to END", out[0], FLOW_END);
 
         n = flow_next_all(&g, "reviewer", "no marker at all", out, FLOW_MAX_NODES);
         eq_int("no marker, no applicable edge", n, 0);
+
+        /* The bug this rule replaces: an agent quoting the code it reviews
+           used to steer the graph with the quote. */
+        n = flow_next_all(&g, "reviewer",
+                          "APPROVED\n\nline 12 reads /* NEEDS_FIX: bounds */\n",
+                          out, FLOW_MAX_NODES);
+        eq_int("a quoted marker is not a verdict: one target, not two", n, 1);
+        eq_str("and it is the declared one", out[0], FLOW_END);
     }
 
     section("an unconditional edge acts as a fallback");
@@ -122,12 +134,19 @@ int main(void) {
             "edge reviewer -> coder when NEEDS_FIX\n"
             "edge reviewer -> END\n"));
 
-        int n = flow_next_all(&g, "reviewer", "NEEDS_FIX please", out, FLOW_MAX_NODES);
+        int n = flow_next_all(&g, "reviewer", "NEEDS_FIX\n\nplease fix the bounds\n",
+                              out, FLOW_MAX_NODES);
         ok("the matching conditional edge is taken", has_target(out, n, "coder"));
 
         n = flow_next_all(&g, "reviewer", "nothing to see", out, FLOW_MAX_NODES);
         eq_int("without a marker, the fallback runs", n, 1);
         eq_str("which is END", out[0], FLOW_END);
+
+        /* A marker buried in a sentence is not a verdict, so this takes the
+           fallback rather than the conditional edge. */
+        n = flow_next_all(&g, "reviewer", "NEEDS_FIX please", out, FLOW_MAX_NODES);
+        eq_int("a marker mid-sentence falls through to the fallback", n, 1);
+        eq_str("which is END, not coder", out[0], FLOW_END);
     }
 
     section("loops are allowed");
