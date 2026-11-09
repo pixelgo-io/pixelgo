@@ -71,6 +71,17 @@ int job_get(const char *id, job_t *out);
 /* Deletes old jobs (cleanup). Returns how many it deleted. */
 int jobs_cleanup(int max_age_seconds);
 
+/*
+ * Fills `out` with the pids of the jobs still marked running whose process is
+ * actually alive, and returns how many it wrote (at most `max`).
+ *
+ * The server needs this at shutdown. A job is forked by the connection child,
+ * so the server is its GRANDparent and never held its pid - the job files in
+ * jobs/ are the only place that does. See src/web/jobs.c for why this does not
+ * go through job_get().
+ */
+int jobs_list_running(pid_t *out, int max);
+
 /* The ABSOLUTE path to a job's event journal (jobs/<id>.events).
    Absolute because the job chdirs into sandboxes. Returns 1 on success. */
 int jobs_events_path(const char *job_id, char *out, size_t out_size);

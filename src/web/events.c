@@ -1,5 +1,6 @@
 #include "events.h"
 #include "jobs.h"
+#include "shutdown.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -235,6 +236,21 @@ int approval_wait(const char *node, const char *tool, const char *input) {
             LOG_I("approval: '%s' %s by the human", tool, allowed ? "allowed" : "denied");
             return allowed;
         }
+        /*
+         * Nobody is going to answer.
+         *
+         * This loop waits for a decision that arrives through the browser, so
+         * the server is its counterpart. Once the server is draining, waiting
+         * out the remaining timeout is waiting for a message from a process
+         * that is going away - which is how an orphaned agent came to spend
+         * five minutes before denying itself. Deny now and say why.
+         */
+        if (shutdown_requested()) {
+            LOG_W("approval: '%s' denied, the server is shutting down", tool);
+            event_approval_done(node, tool, 0);
+            return 0;
+        }
+
         usleep(APPROVAL_POLL_US);
         waited_ms += APPROVAL_POLL_US / 1000;
     }
@@ -407,6 +423,15 @@ int data_edit_wait(const char *node, const char *tool,
                   (allowed ? " (unchanged)" : ""));
             return allowed;
         }
+        /* Same reasoning as in approval_wait: the browser's decision travels
+           through the server, so a draining server means no decision is coming. */
+        if (shutdown_requested()) {
+            remove(source_path);
+            LOG_W("data_edit: '%s' denied, the server is shutting down", tool);
+            event_data_edit_done(node, tool, 0);
+            return 0;
+        }
+
         usleep(APPROVAL_POLL_US);
         waited_ms += APPROVAL_POLL_US / 1000;
     }

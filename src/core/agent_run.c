@@ -1,5 +1,6 @@
 #include "agent_run.h"
 #include "ai_loop.h"
+#include "shutdown.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,67 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/types.h>
+
+/*
+ * Which agents are alive right now, so a shutdown can reach them.
+ *
+ * An agent is in its own process group, so nothing above it can find it by
+ * walking groups - the pid has to be remembered here, at the only level that
+ * knows it. The table is read from a signal handler, so it holds plain
+ * sig_atomic_t slots and the sink below touches nothing else.
+ *
+ * A dead agent's slot is cleared as soon as it is reaped (agent_forget). That
+ * matters: pids are recycled, and a stale slot would eventually name some other
+ * process group.
+ */
+#define AGENT_LIVE_MAX 64
+
+static volatile sig_atomic_t g_live_pids[AGENT_LIVE_MAX];
+
+static void live_add(pid_t pid) {
+    for (int i = 0; i < AGENT_LIVE_MAX; i++) {
+        if (g_live_pids[i] == 0) { g_live_pids[i] = (sig_atomic_t)pid; return; }
+    }
+    LOG_W("agent_start: live-agent table full, pid %d will not be signalled "
+          "on shutdown", (int)pid);
+}
+
+static void live_del(pid_t pid) {
+    for (int i = 0; i < AGENT_LIVE_MAX; i++) {
+        if (g_live_pids[i] == (sig_atomic_t)pid) { g_live_pids[i] = 0; return; }
+    }
+}
+
+/*
+ * Shutdown sink: asks every live agent's GROUP to stop.
+ *
+ * The first call is the polite half only. Escalating to SIGKILL means waiting
+ * first, and a handler cannot wait - so the ordinary escalation happens in
+ * agent_wait, which notices the request and calls agent_stop (SIGTERM, grace,
+ * SIGKILL, reap). This call is what makes a blocked agent return promptly so
+ * that unwinding can begin at all.
+ *
+ * A second call means the person is not waiting for that unwinding any more
+ * (shutdown.h), and this process is about to die with it - so there is no later
+ * to escalate in. SIGKILL now, or the agent outlives us.
+ */
+static void stop_live_agents(int sig) {
+    (void)sig;
+    static volatile sig_atomic_t called = 0;
+    int force = called;
+    called = 1;
+
+    for (int i = 0; i < AGENT_LIVE_MAX; i++) {
+        pid_t pid = (pid_t)g_live_pids[i];
+        if (pid > 0) kill(-pid, force ? SIGKILL : SIGTERM);
+    }
+}
+
+/* The agent is gone: forget its pid in both places that track it. */
+static void agent_forget(agent_t *agent) {
+    if (agent->pid > 0) live_del(agent->pid);
+    agent->pid = 0;
+}
 
 /* Applies the resource limits in the child process (after fork, before exec/loop).
    Only fields > 0 are enforced; 0 = keep the system default. */
@@ -126,6 +188,12 @@ int agent_start(agent_t *agent, const char *task) {
     setpgid(pid, pid); /* here too, to avoid a race with the child */
     agent->pid = pid;
     agent->status = AGENT_RUNNING;
+
+    /* From here on a shutdown has to be able to find this agent. Registering
+       the sink here rather than at init keeps it out of processes that never
+       start an agent; shutdown_register_sink is idempotent. */
+    live_add(pid);
+    shutdown_register_sink(stop_live_agents);
     return 0;
 }
 
@@ -211,40 +279,27 @@ static int settle_unknown_status(agent_t *agent) {
         agent->status = AGENT_FAILED;
     }
 
-    agent->pid = 0;
+    agent_forget(agent);
     reclaim_terminal();
     return agent->status == AGENT_STOPPED ? 0 : -1;
 }
 
+/*
+ * Waits for the agent, polling every 100ms.
+ *
+ * It polls even when there is no timeout to enforce, which used to be a plain
+ * blocking waitpid(). The poll is what makes a shutdown possible: the request
+ * arrives as a flag, and a process parked in waitpid() cannot read a flag. The
+ * cost is one wakeup per 100ms per running agent, which is nothing next to a
+ * model call.
+ */
 int agent_wait(agent_t *agent) {
     if (agent->pid <= 0) return -1;
 
     long timeout = agent->limits.timeout_seconds;
-
-    if (timeout <= 0) {
-        /* no timeout: simple blocking wait */
-        int status;
-        if (waitpid(agent->pid, &status, 0) < 0) {
-            if (errno == ECHILD) return settle_unknown_status(agent);
-            LOG_E("agent_wait: waitpid failed: %s", strerror(errno));
-            agent->status = AGENT_FAILED;
-            agent->pid = 0;
-            reclaim_terminal();
-            return -1;
-        }
-        reclaim_terminal();
-        int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        agent->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-        agent->status = ok ? AGENT_STOPPED : AGENT_FAILED;
-        LOG_I("agent_wait: '%s' finished, exit=%d status=%s",
-              agent->id, agent->exit_code, ok ? "OK" : "FAILED");
-        agent->pid = 0;
-        return ok ? 0 : -1;
-    }
-
-    /* with timeout: polling every 100ms until the deadline */
-    time_t deadline = time(NULL) + timeout;
+    time_t deadline = timeout > 0 ? time(NULL) + timeout : 0;   /* 0 = no deadline */
     int status;
+
     for (;;) {
         int r = try_reap(agent->pid, &status);
         if (r == 1) {
@@ -254,18 +309,35 @@ int agent_wait(agent_t *agent) {
             agent->status = ok ? AGENT_STOPPED : AGENT_FAILED;
             LOG_I("agent_wait: '%s' finished, exit=%d status=%s",
                   agent->id, agent->exit_code, ok ? "OK" : "FAILED");
-            agent->pid = 0;
+            agent_forget(agent);
             return ok ? 0 : -1;
         }
         if (r == -2) return settle_unknown_status(agent);   /* see try_reap */
         if (r < 0) {
             LOG_E("agent_wait: waitpid failed: %s", strerror(errno));
             agent->status = AGENT_FAILED;
-            agent->pid = 0;
+            agent_forget(agent);
             reclaim_terminal();
             return -1;
         }
-        if (time(NULL) >= deadline) {
+
+        /*
+         * Shutdown. The sink has already sent SIGTERM to the group, so most
+         * agents are on their way out and the reap above will catch them. This
+         * branch is the escalation for one that is not: agent_stop waits out
+         * its own grace period and then SIGKILLs the group, which is where a
+         * stuck `make` or `docker build` under the agent actually dies.
+         */
+        if (shutdown_requested()) {
+            LOG_W("agent_wait: shutdown requested, stopping '%s' (pid %d)",
+                  agent->id, (int)agent->pid);
+            agent_stop(agent);                   /* TERM, grace, KILL, reap */
+            agent->status = AGENT_FAILED;
+            reclaim_terminal();
+            return -1;
+        }
+
+        if (deadline && time(NULL) >= deadline) {
             LOG_W("agent_wait: '%s' exceeded the %lds timeout, stopping it",
                   agent->id, timeout);
             agent_stop(agent);
@@ -291,8 +363,8 @@ int agent_stop(agent_t *agent) {
     int status;
     for (int i = 0; i < 30; i++) {
         int r = try_reap(pid, &status);
-        if (r == 1) { agent->pid = 0; LOG_I("agent_stop: '%s' stopped cleanly", agent->id); return 0; }
-        if (r < 0)  { agent->pid = 0; return 0; }
+        if (r == 1) { agent_forget(agent); LOG_I("agent_stop: '%s' stopped cleanly", agent->id); return 0; }
+        if (r < 0)  { agent_forget(agent); return 0; }
         struct timespec ts = { 0, 100 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
@@ -301,7 +373,7 @@ int agent_stop(agent_t *agent) {
     LOG_W("agent_stop: '%s' did not respond to SIGTERM, sending SIGKILL", agent->id);
     signal_group(pid, SIGKILL);
     waitpid(pid, &status, 0); /* reap so no zombie remains */
-    agent->pid = 0;
+    agent_forget(agent);
     return 0;
 }
 
@@ -311,6 +383,14 @@ int agent_run_supervised(agent_t *agent, const char *task, int max_restarts) {
         if (agent_start(agent, task) != 0) return -1;
         int rc = agent_wait(agent);
         if (rc == 0) return 0; /* success */
+
+        /* Nor do we restart into a shutdown: the failure we just saw IS the
+           shutdown, and restarting would fork an agent for the drain to kill. */
+        if (shutdown_requested()) {
+            LOG_W("supervised: '%s' not restarted, the server is shutting down",
+                  agent->id);
+            return -1;
+        }
 
         /* We do not restart if it was stopped by timeout - it is probably structurally stuck. */
         if (agent->status == AGENT_TIMEOUT) {

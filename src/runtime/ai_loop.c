@@ -8,6 +8,7 @@
 #include "events.h"
 #include "log.h"
 #include "data_request_audit.h"
+#include "shutdown.h"
 #include "http_server.h"   /* for HTTP_MAX_BODY_CEILING - see the edited_text
                                buffer sizing in the data-approval gateway below */
 #include <unistd.h>
@@ -391,6 +392,7 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
     }
 
     int rc = -1;
+    int shutdown_stop = 0;   /* stopped by a drain, not by an error */
 
     /* We accumulate usage over the whole loop (an agent can make several calls:
        tool_use -> result -> tool_use -> ... -> final response). */
@@ -403,6 +405,21 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
     int length_retry_done = 0;
 
     for (int iter = 0; iter < max_iterations; iter++) {
+        /*
+         * Do not start another model call into a shutdown. A chat job runs this
+         * loop in the job process itself, so this is where that job hears the
+         * drain: a tool call already in flight was stopped by its own sink, and
+         * the next thing the loop would otherwise do is spend a request on an
+         * answer nobody is left to read.
+         */
+        if (shutdown_requested()) {
+            LOG_W("ai_loop: agent=%s stopping at iteration %d, the server is "
+                  "shutting down", agent->id, iter + 1);
+            shutdown_stop = 1;
+            rc = -1;
+            break;   /* out through the normal tail: the history is still saved */
+        }
+
         LOG_I("ai_loop: agent=%s iteration=%d/%d -> call %s (%s)",
               agent->id, iter + 1, max_iterations,
               provider_to_string(agent->cfg.ai.provider), agent->cfg.ai.model);
@@ -723,7 +740,7 @@ static int ai_loop_run_internal(agent_t *agent, const char *task, int persist_hi
         provider_response_free(&presp);
     }
 
-    if (rc != 0)
+    if (rc != 0 && !shutdown_stop)
         LOG_E("ai_loop: agent=%s stopped without a final response "
               "(provider error, or the %d-iteration limit was reached - "
               "raise it with PIXELGO_MAX_ITERATIONS)",

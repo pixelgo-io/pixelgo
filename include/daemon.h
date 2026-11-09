@@ -23,11 +23,26 @@
    The parent does NOT return - it exits immediately with exit(0). */
 int daemon_start(int port);
 
-/* Stops the running daemon (reads the PID file, sends SIGTERM).
-   Returns 0 on success, -1 if it is not running or cannot be stopped. */
+/*
+ * Writes the PID file for a server that is NOT detaching, and refuses if
+ * another one already holds it. Returns 0 on success, -1 otherwise.
+ *
+ * A foreground `serve` needs this for one reason: `serve stop` works by sending
+ * SIGTERM to the pid in that file. Without it, a server started without
+ * --daemon could not be stopped by the command that exists for stopping it, so
+ * the shutdown path would be there and unreachable for half of the ways people
+ * start the server.
+ */
+int daemon_claim_pidfile(int port);
+
+/*
+ * Stops the running server: reads the PID file, sends SIGTERM, and waits for
+ * the drain (shutdown_timeout_seconds() plus a margin) before resorting to
+ * SIGKILL. Returns 0 on success, -1 if it is not running or cannot be stopped.
+ */
 int daemon_stop(void);
 
-/* Displays the daemon's status. Returns 1 if running, 0 otherwise. */
+/* Displays the server's status. Returns 1 if running, 0 otherwise. */
 int daemon_status(void);
 
 /* Deletes the PID file (called on clean exit). */

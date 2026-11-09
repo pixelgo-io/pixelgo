@@ -1,4 +1,7 @@
 #include "http_server.h"
+#include "jobs.h"
+#include "daemon.h"
+#include "shutdown.h"
 #include "log.h"
 #include "data_request_audit.h"   /* for the shared data_threshold_parse() -
                                      see http_max_body() below: KB/MB/GB/off
@@ -11,6 +14,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -498,6 +502,102 @@ static void reap_children(int sig) {
     errno = saved_errno;
 }
 
+/* How many tracked children are still alive. */
+static int live_children(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_TRACKED_CHILDREN; i++)
+        if (g_child_pids[i] != 0) n++;
+    return n;
+}
+
+#define MAX_DRAINED_JOBS 128
+
+/*
+ * The drain.
+ *
+ * Runs after the accept loop has stopped, in the server process, with signals
+ * already delivered - so there is nothing async-signal-safe about it and it can
+ * log, sleep and read files.
+ *
+ * The order matters. The listening socket is already closed, so no new work can
+ * arrive. Then the jobs are asked to stop, because they are the ones holding
+ * agents; the agents are in their own process groups and only their job knows
+ * their pids, so the server cannot shortcut past them (shutdown.h explains why
+ * each level has to stop the one below it). Only when the deadline passes does
+ * anything get killed.
+ *
+ * Returns the number of processes that had to be killed - zero means everything
+ * stopped when it was asked to.
+ */
+static int drain_children(void) {
+    long timeout = shutdown_timeout_seconds();
+
+    pid_t jobs[MAX_DRAINED_JOBS];
+    int job_count = jobs_list_running(jobs, MAX_DRAINED_JOBS);
+
+    LOG_I("http: draining - %d connection child(ren), %d running job(s), "
+          "deadline %lds", live_children(), job_count, timeout);
+
+    /*
+     * Ask the jobs to stop. A job's own handler (jobs.c) turns this into
+     * agent_stop for each agent it started, which signals the agent's GROUP -
+     * that is what reaches a `gcc` or a `make` under the agent.
+     *
+     * The connection children are left alone: each one is serving a single
+     * request and exits by itself, and one of them is the job's parent, whose
+     * waitpid we would rather not interrupt.
+     */
+    for (int i = 0; i < job_count; i++) {
+        if (kill(jobs[i], SIGTERM) == 0)
+            LOG_I("http: asked job pid %d to stop", (int)jobs[i]);
+    }
+
+    /* Wait, reaping as they go. SIGCHLD is still installed, so most of the
+       reaping happens in the handler; this loop is what notices the end of it. */
+    time_t deadline = time(NULL) + timeout;
+    for (;;) {
+        reap_children(0);
+
+        int remaining = 0;
+        for (int i = 0; i < job_count; i++)
+            if (jobs[i] > 0 && !(kill(jobs[i], 0) != 0 && errno == ESRCH)) remaining++;
+
+        if (remaining == 0 && live_children() == 0) {
+            LOG_I("http: drained cleanly");
+            return 0;
+        }
+        if (time(NULL) >= deadline) {
+            LOG_W("http: %d job(s) and %d connection child(ren) still alive at "
+                  "the %lds deadline", remaining, live_children(), timeout);
+            break;
+        }
+        struct timespec ts = { 0, 100 * 1000 * 1000 };   /* 100ms */
+        nanosleep(&ts, NULL);
+    }
+
+    /* The deadline passed: stop asking. */
+    int killed = 0;
+    for (int i = 0; i < job_count; i++) {
+        if (jobs[i] > 0 && kill(jobs[i], SIGKILL) == 0) {
+            LOG_W("http: killed job pid %d", (int)jobs[i]);
+            killed++;
+        }
+    }
+    for (int i = 0; i < MAX_TRACKED_CHILDREN; i++) {
+        pid_t pid = (pid_t)g_child_pids[i];
+        if (pid == 0) continue;
+        kill(pid, SIGKILL);
+        killed++;
+    }
+
+    /* Give the kernel a moment to deliver, then reap so nothing is left as a
+       zombie for init to adopt. */
+    struct timespec ts = { 0, 200 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    reap_children(0);
+    return killed;
+}
+
 int http_serve(int port, http_handler_fn handler) {
     /* We do not want to die if a client abruptly closes the connection. */
     signal(SIGPIPE, SIG_IGN);
@@ -509,6 +609,21 @@ int http_serve(int port, http_handler_fn handler) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);
+
+    /*
+     * Shutdown handlers, WITHOUT SA_RESTART - the 1 says so.
+     *
+     * This is the one place in the program that needs the interruption: the
+     * server spends its life parked in accept(), and with SA_RESTART that call
+     * would resume after the signal and the loop would never get to look at the
+     * flag. Note that the SIGCHLD handler above keeps SA_RESTART, so the two
+     * dispositions differ on purpose and for different reasons.
+     *
+     * Installing them here also replaces what daemon_start() used to do, which
+     * was to delete the PID file and _exit(0) immediately. That was a shutdown
+     * only in the sense that the server stopped.
+     */
+    shutdown_install_handlers(1);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -565,14 +680,26 @@ int http_serve(int port, http_handler_fn handler) {
     printf("  Ctrl+C to stop.\n\n");
     fflush(stdout);
 
-    for (;;) {
+    while (!shutdown_requested()) {
         struct sockaddr_in cli;
         socklen_t clilen = sizeof(cli);
         int fd = accept(srv, (struct sockaddr *)&cli, &clilen);
         if (fd < 0) {
+            /* A shutdown signal is what this EINTR usually is: the handler is
+               installed without SA_RESTART precisely so accept() lands here.
+               The loop condition sorts the two cases out. */
             if (errno == EINTR) continue;
             LOG_W("http: accept failed: %s", strerror(errno));
             continue;
+        }
+
+        /* The signal can also arrive between accept() returning and the fork.
+           Closing the connection unserved is better than starting work we are
+           about to abandon; the browser sees a dropped connection, which is
+           what it would have seen a moment later anyway. */
+        if (shutdown_requested()) {
+            close(fd);
+            break;
         }
 
         /*
@@ -625,6 +752,24 @@ int http_serve(int port, http_handler_fn handler) {
         close(fd);
     }
 
+    /* Stop listening first, so nothing new arrives while we drain. */
     close(srv);
+
+    LOG_I("http: shutting down");
+    printf("\n  Stopping - waiting for the running jobs...\n");
+    fflush(stdout);
+
+    int killed = drain_children();
+
+    /* The PID file is ours for as long as we are the server, in both foreground
+       and daemon mode; this is the one exit where we can still remove it. */
+    daemon_cleanup_pidfile();
+
+    if (killed > 0)
+        printf("  Stopped (%d process(es) had to be killed).\n\n", killed);
+    else
+        printf("  Stopped.\n\n");
+    fflush(stdout);
+
     return 0;
 }
