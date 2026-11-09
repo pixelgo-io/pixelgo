@@ -1261,10 +1261,52 @@ would end the session rather than the current turn.
 The plumbing is `include/shutdown.h`: one flag and a list of sinks, everything
 reachable from a handler being async-signal-safe.
 
+### A second door: the unix socket
+
+`PIXELGO_UNIX_SOCKET=/run/pixelgo/api.sock` makes the server listen on that
+unix socket **as well as** on TCP. The same HTTP code serves both — HTTP does
+not care what kind of stream socket it runs over — and the TCP side is
+unchanged, so a local install that sets nothing gets exactly what it got
+before.
+
+This exists for pixelgo-ops. ops runs outside the VM and needs pixelgo's API
+without a network in between; the decided channel is vsock, and a unix socket
+is the same listener with a different address family. It comes first because it
+is a **file**: ops can be built and tested against a real pixelgo today, with
+no hypervisor and no VM in the way.
+
+Two things about it differ from the TCP side, both on purpose:
+
+**Access control is the filesystem.** The socket is created `0600`, so only the
+user running pixelgo can connect. That is the same trust boundary as the
+loopback bind, expressed without involving the network at all — put the socket
+in a directory you control, not in `/tmp`.
+
+**The `Host`/`Origin` check does not apply.** That check defends a *browser*
+against being talked into reaching the API — a rebound hostname, a form on
+another page — and it works by recognising our own authority in those headers.
+A unix socket has no authority to recognise and no browser can open one; the
+caller is a process that already holds `0600` access to the socket file.
+Applying the rule here would mean guessing what `Host` a non-browser client
+ought to have sent.
+
+The socket file is removed when the server stops. One left behind by a crash
+looks identical to a live one, so on start the server **asks**: if something
+answers on it, that is another pixelgo and it refuses to start; if nothing
+answers, the file is stale and is replaced. A path that is not a socket, or one
+too long for `sun_path`, is a configuration error and is refused rather than
+deleted or truncated.
+
+```bash
+PIXELGO_UNIX_SOCKET=/run/pixelgo/api.sock pixelgo serve 8080
+
+curl --unix-socket /run/pixelgo/api.sock http://localhost/api/workspaces
+```
+
 ### Security
 
-- Listens **only on 127.0.0.1**. Not exposed on the network, no authentication —
-  it is a local control panel.
+- Over TCP, listens **only on 127.0.0.1**. Not exposed on the network, no
+  authentication — it is a local control panel.
 - Workspace names with `/` or `..` are rejected.
 - Graphs only from `examples/` (no traversal). Job ids with `..` are rejected.
 - Agents stay sandboxed exactly as in the CLI.
@@ -1283,7 +1325,7 @@ authentication.
 | POST | `/api/chat` | `{ws, agent, message}` | **`202 {job_id}`** |
 | POST | `/api/flow/run` | `{ws, flow, task}` | **`202 {job_id}`** |
 | GET | `/api/jobs/<id>` | — | `{status, reply\|outputs\|error}` |
-| GET | `/api/history?ws=X&agent=Y` | — | mesaje |
+| GET | `/api/history?ws=X&agent=Y` | — | messages |
 | POST | `/api/history/reset` | `{ws, agent}` | `{ok}` |
 | GET | `/api/flows` | — | list |
 | POST | `/api/flow/diagram` | `{flow}` | `{mermaid}` |
