@@ -1137,7 +1137,7 @@ pixelgo serve                  # foreground, http://127.0.0.1:8080
 pixelgo serve 3000             # another port
 pixelgo serve --daemon         # in the background (daemon)
 pixelgo serve status           # running? on what pid/port?
-pixelgo serve stop             # stop the daemon
+pixelgo serve stop             # stop it, draining the running jobs first
 ```
 
 Three tabs: **Chat** (conversation with history, you also see the tools used),
@@ -1196,8 +1196,70 @@ Measured: 10 simultaneous requests -> all 200 OK. 3 slow jobs started in 33ms
 
 `--daemon` does `fork` + `setsid` (double fork), redirects I/O to `pixelgo.log`,
 and writes `pixelgo.pid`. The process is reparented to init (PPID=1), so it
-**survives closing the terminal**. A second start is refused. `stop` sends
-SIGTERM (then SIGKILL if it does not respond) and removes the PID file.
+**survives closing the terminal**. A second start is refused.
+
+`pixelgo.pid` is written in the foreground too, not only with `--daemon`.
+`serve stop` works by sending SIGTERM to the pid in that file, so without it a
+server started the ordinary way could not be stopped by the command that exists
+for stopping it. `serve status` therefore reports either mode, and says
+`Server:` rather than `Daemon:`.
+
+### Shutdown
+
+A running flow is a tree of processes, and each level puts the next one in a
+**new process group**:
+
+```
+  pixelgo serve          the server, one fork per connection
+    connection child     runs the handler, forks the job
+      job child          ai_loop (chat) or orchestrator (flow)
+        agent            setpgid(0,0)   - agent_run.c
+          run_command    setpgid(0,0)   - exec_tools.c
+```
+
+A signal sent to a process group stops at that group. Ctrl+C goes to the
+terminal's foreground group, which reaches the server and the job but **not**
+the agents. That is why stopping the server used to leave agents running: not a
+handler that was late, one that was never invoked.
+
+So shutdown is a relay, in which each level stops the level below it because
+only that level knows its own children:
+
+| level | what it does | how it finds them |
+| --- | --- | --- |
+| server | SIGTERM each running job, SIGKILL at the deadline | the job files in `jobs/` |
+| job | `agent_stop` per agent: SIGTERM, 3s, SIGKILL — to the **group** | `agent_run.c`'s live table |
+| agent | the same, for the command it is running | `exec_tools.c`'s current pid |
+
+Along the way, the loops that could otherwise wait for something that no longer
+exists give up instead: the orchestrator does not open a new step, `ai_loop`
+does not start another model call, and an approval wait denies at once rather
+than running out its 300-second timeout — which is what an orphaned agent used
+to spend before failing closed.
+
+`PIXELGO_STOP_TIMEOUT` (default 10s, max 300) is how long the server spends
+asking before it starts killing. It is configurable because it has to fit
+inside `TimeoutStopSec` when pixelgo runs under systemd: a drain longer than
+that is a drain that gets SIGKILLed halfway through.
+
+`serve stop` waits that long plus two seconds before resorting to SIGKILL
+itself — longer than the drain, never shorter, or it would orphan exactly the
+processes the drain exists to collect.
+
+**A second Ctrl+C is fatal.** The first one starts the drain, which is not
+instant: it can be waiting on a model call that has nothing to do with signals.
+The second one escalates every sink from SIGTERM to SIGKILL and then lets the
+signal do what it would have done without a handler, so the tree goes down with
+it rather than being left behind mid-grace-period.
+
+The same relay runs for `pixelgo agent run` and `pixelgo flow run`, where the
+nodes are in their own groups for the same reason. `pixelgo agent chat` is
+deliberately left alone: the agent runs in the CLI process itself, there is
+nothing below it to orphan, and a flag is one-way — a Ctrl+C at the prompt
+would end the session rather than the current turn.
+
+The plumbing is `include/shutdown.h`: one flag and a list of sinks, everything
+reachable from a handler being async-signal-safe.
 
 ### Security
 
@@ -1354,4 +1416,6 @@ third_party/cJSON/        JSON parser (vendored)
   the machine's memory or CPU.
 - **No zombies**: all processes are waited on (`waitpid`); on timeout SIGTERM is
   sent to the whole process group, then SIGKILL.
+- **No orphans**: stopping the server drains the tree below it rather than
+  exiting out from under it — see [Shutdown](#shutdown).
 - **Loop limits**: `AI_LOOP_MAX_ITERATIONS` (20) and `ORCH_MAX_STEPS` (50).

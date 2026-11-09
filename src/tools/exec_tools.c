@@ -4,6 +4,7 @@
 #include "log.h"
 #include "confine.h"
 #include "events.h"
+#include "shutdown.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,6 +137,41 @@ static void stream_feed(stream_ctx_t *s, const char *data, size_t n) {
         s->line[s->len++] = c;
         if (s->len >= STREAM_LINE_MAX) stream_flush(s);
     }
+}
+
+/*
+ * The command running right now, so a shutdown can reach it.
+ *
+ * There is at most one: run_command is synchronous, and the agent process sits
+ * in the read loop below until the command ends. Its child is a process group
+ * leader, so the group is what gets signalled - otherwise a `make` dies and
+ * leaves its `gcc` behind.
+ *
+ * Read from a signal handler, hence sig_atomic_t and nothing but kill() in the
+ * sink. The escalation to SIGKILL is in the read loop, which can afford to
+ * wait; see shutdown.h.
+ */
+static volatile sig_atomic_t g_running_cmd_pid = 0;
+
+/* Called a second time, this kills rather than asks - see shutdown.h and the
+   matching sink in agent_run.c. */
+static void stop_running_command(int sig) {
+    (void)sig;
+    static volatile sig_atomic_t called = 0;
+    int force = called;
+    called = 1;
+
+    pid_t pid = (pid_t)g_running_cmd_pid;
+    if (pid > 0) kill(-pid, force ? SIGKILL : SIGTERM);
+}
+
+static void cmd_running_set(pid_t pid) {
+    g_running_cmd_pid = (sig_atomic_t)pid;
+    shutdown_register_sink(stop_running_command);   /* idempotent */
+}
+
+static void cmd_running_clear(void) {
+    g_running_cmd_pid = 0;
 }
 
 tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
@@ -289,6 +325,7 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
 
     /* --- parent --- */
     setpgid(pid, pid);
+    cmd_running_set(pid);   /* so a shutdown can reach the command's group */
     close(pipefd[1]);
     cJSON_Delete(args);   /* argv pointed into args; after fork, the child has its own copy */
 
@@ -298,6 +335,7 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
     size_t total = 0;
     time_t deadline = time(NULL) + timeout;
     int timed_out = 0;
+    int interrupted = 0;   /* the server is shutting down, not a timeout */
     int buffer_full = 0;
     int got_eof = 0;
 
@@ -360,6 +398,10 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
 
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             if (time(NULL) >= deadline) { timed_out = 1; break; }
+            /* A shutdown leaves the same way a timeout does - kill the group,
+               keep the partial output - but it is not the command's fault, so
+               it is reported as its own thing. */
+            if (shutdown_requested()) { interrupted = 1; break; }
             struct timespec ts = { 0, 50 * 1000 * 1000 };   /* 50ms */
             nanosleep(&ts, NULL);
             continue;
@@ -376,15 +418,25 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
     r.output[total] = 0;
     close(pipefd[0]);
 
-    /* --- TIMEOUT: we kill the whole process group --- */
-    if (timed_out) {
-        LOG_W("run_command: '%s' exceeded the %lds timeout, stopping it", cmd, timeout);
+    /* --- TIMEOUT or SHUTDOWN: we kill the whole process group --- */
+    if (timed_out || interrupted) {
+        if (timed_out)
+            LOG_W("run_command: '%s' exceeded the %lds timeout, stopping it", cmd, timeout);
+        else
+            LOG_W("run_command: shutdown requested, stopping '%s'", cmd);
+
         kill(-pid, SIGTERM);
         struct timespec ts = { 1, 0 };
         nanosleep(&ts, NULL);
         kill(-pid, SIGKILL);
         int status;
         waitpid(pid, &status, 0);
+        cmd_running_clear();
+
+        if (interrupted)
+            return tool_err("command '%s' was stopped: the server is shutting down\n\n"
+                            "--- Partial output ---\n%s", cmd, r.output);
+
         return tool_err("command '%s' timed out after %ld seconds (killed)\n\n"
                         "--- Partial output ---\n%s", cmd, timeout, r.output);
     }
@@ -444,6 +496,7 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
         int status = 0;
         pid_t w;
         do { w = waitpid(pid, &status, 0); } while (w < 0 && errno == EINTR);
+        cmd_running_clear();
 
         int code = -1;
         if (w == pid) {
@@ -484,6 +537,7 @@ tool_result_t tool_run_command(agent_t *agent, const char *input_json) {
     do {
         w = waitpid(pid, &status, 0);
     } while (w < 0 && errno == EINTR);
+    cmd_running_clear();
 
     int code;
     if (w != pid) {

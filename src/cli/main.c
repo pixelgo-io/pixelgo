@@ -9,6 +9,7 @@
 #include "http_server.h"
 #include "web_api.h"
 #include "daemon.h"
+#include "shutdown.h"
 #include "jobs.h"
 #include "envfile.h"
 #include "selfhost.h"
@@ -326,6 +327,11 @@ static int cmd_agent_run(const char *ws_name, const char *agent_id, const char *
     printf("Starting agent '%s' (type=%s)...\n", agent_id,
            agent->type == AGENT_TYPE_WORKER ? "worker" : "ai");
 
+    /* Ctrl+C here has the same problem it had in the server: the agent is in
+       its own process group and never hears it. With SA_RESTART, because this
+       process waits in waitpid(). A second Ctrl+C is fatal - see shutdown.h. */
+    shutdown_install_handlers(0);
+
     /* Supervised run: workers are not restarted (max_restarts=0, a fixed command
        that fails will fail the same way); AI agents can be restarted once on a
        transient failure (e.g. a network outage caught after retries ran out). */
@@ -449,6 +455,9 @@ static int cmd_serve(int port, int as_daemon) {
         if (daemon_start(port) != 0) return 1;
     } else {
         printf("Starting pixelgo web interface...\n");
+        /* The PID file in the foreground too, so `serve stop` can reach us.
+           http_serve removes it when it finishes draining. */
+        if (daemon_claim_pidfile(port) != 0) return 1;
     }
 
     /* We clean up old jobs (over 24h) at startup. */
@@ -456,7 +465,7 @@ static int cmd_serve(int port, int as_daemon) {
 
     if (http_serve(port, web_handler) != 0) {
         fprintf(stderr, "Could not start the server on port %d\n", port);
-        if (as_daemon) daemon_cleanup_pidfile();
+        daemon_cleanup_pidfile();
         return 1;
     }
     return 0;
@@ -485,6 +494,11 @@ static int cmd_flow_run(const char *ws_name, const char *flow_file, const char *
 
     printf("Running graph '%s' over workspace '%s' (entry=%s)...\n",
            flow_file, ws_name, g.entry);
+
+    /* Same as `agent run`: the nodes are in their own process groups, so
+       Ctrl+C has to be relayed rather than left to the terminal. */
+    shutdown_install_handlers(0);
+
     int rc = orchestrator_run(&ws, &g, task);
     printf("Graph finished, status=%s\n", rc == 0 ? "OK" : "FAILED");
     return rc == 0 ? 0 : 1;

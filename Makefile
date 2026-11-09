@@ -11,6 +11,7 @@ SRC = \
 	src/core/flow.c \
 	src/core/orchestrator.c \
 	src/core/log.c \
+	src/core/shutdown.c \
 	src/core/history.c \
 	src/core/envfile.c \
 	src/core/usage.c \

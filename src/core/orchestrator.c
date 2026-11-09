@@ -1,5 +1,6 @@
 #include "orchestrator.h"
 #include "agent_run.h"
+#include "shutdown.h"
 #include "log.h"
 #include "usage.h"
 #include "provider.h"
@@ -160,7 +161,7 @@ static void report_costs(workspace_t *ws, const flow_graph_t *g) {
        aggregate `total` which can no longer be split back out by model. */
     long total_cost_no_cache = 0;
 
-    LOG_I("--- cost pe agent ---");
+    LOG_I("--- cost per agent ---");
 
     for (int i = 0; i < g->node_count; i++) {
         agent_t *a = workspace_find_agent(ws, g->nodes[i]);
@@ -261,6 +262,18 @@ int orchestrator_run(workspace_t *ws, const flow_graph_t *g, const char *initial
     int reached_end = 0;
 
     for (int step = 0; step < ORCH_MAX_STEPS; step++) {
+        /*
+         * Do not open a new step into a shutdown. The agents of the step that
+         * is already running are stopped by agent_wait below; starting more of
+         * them here would mean forking processes for the sole purpose of
+         * killing them a moment later.
+         */
+        if (shutdown_requested()) {
+            LOG_W("orch: shutdown requested, not starting step %d", step + 1);
+            event_graph_failed("the server is shutting down");
+            return -1;
+        }
+
         LOG_I("orch: step %d - running %d node(s) in parallel", step + 1, frontier_count);
 
         /* --- FAN-OUT: we start all nodes in the frontier simultaneously --- */

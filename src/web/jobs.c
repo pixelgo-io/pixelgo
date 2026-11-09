@@ -8,6 +8,7 @@
 #include "usage.h"
 #include "events.h"
 #include "provider.h"
+#include "shutdown.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,8 +97,72 @@ int jobs_init(void) {
         g_jobs_dir[0] = 0;
         return 0;
     }
-    LOG_D("jobs: director de job-uri: %s", g_jobs_dir);
+    LOG_D("jobs: job directory: %s", g_jobs_dir);
     return 1;
+}
+
+/*
+ * The pids of the jobs that are still running.
+ *
+ * This is how the server finds its grandchildren at shutdown. A job is forked
+ * by the connection child, not by the server, so the server never had its pid:
+ * the only record is the one on disk. Reading it back is not elegant, and it is
+ * the same registry the API already answers /api/jobs/<id> from.
+ *
+ * Deliberately not job_get(): that one rewrites a job file whose process has
+ * died, which is a thing to do when answering a question about a job, not while
+ * walking the list in order to signal it. Here a dead pid is simply skipped.
+ */
+int jobs_list_running(pid_t *out, int max) {
+    if (!out || max <= 0) return 0;
+    if (!jobs_init()) return 0;
+
+    DIR *d = opendir(g_jobs_dir);
+    if (!d) return 0;
+
+    int found = 0;
+    struct dirent *e;
+
+    while ((e = readdir(d)) != NULL && found < max) {
+        if (e->d_name[0] == '.') continue;
+
+        /* only the state files: jobs/ also holds .events and .approval */
+        const char *dot = strrchr(e->d_name, '.');
+        if (!dot || strcmp(dot, ".json") != 0) continue;
+
+        char path[MAX_PATH_LEN + 300];
+        snprintf(path, sizeof(path), "%s/%s", g_jobs_dir, e->d_name);
+
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+
+        /* We only need status and pid, both near the front of the object, so we
+           read a header rather than the whole result field. */
+        char buf[512];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = 0;
+        fclose(f);
+
+        /* Cut before "result": its text is the agent's output and could contain
+           anything, including an escaped copy of the fields we match on below.
+           job_write puts id, status, pid and kind ahead of it, so cutting here
+           loses nothing we need. */
+        char *result_key = strstr(buf, "\"result\"");
+        if (result_key) *result_key = 0;
+
+        if (!strstr(buf, "\"status\":\"running\"") &&
+            !strstr(buf, "\"status\": \"running\"")) continue;
+
+        const char *p = strstr(buf, "\"pid\":");
+        if (!p) continue;
+        long pid = strtol(p + 6, NULL, 10);
+        if (pid <= 1) continue;
+        if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) continue;   /* already gone */
+
+        out[found++] = (pid_t)pid;
+    }
+    closedir(d);
+    return found;
 }
 
 int job_get(const char *id, job_t *out) {
@@ -184,6 +249,22 @@ static int job_fork(const char *kind, job_t *job, char out_id[JOB_ID_LEN]) {
         /* We reset SIGCHLD: we inherit the server's handler, which would steal our
            children (the agents, and further down run_command's processes). */
         signal(SIGCHLD, SIG_DFL);
+
+        /*
+         * Shutdown handlers, WITH SA_RESTART.
+         *
+         * The job is not in its own process group, so a terminal Ctrl+C reaches
+         * it directly, and until now the default disposition applied: the job
+         * died on the spot and left its agents - which ARE in their own groups -
+         * running. With a handler it drains instead, stopping what it started.
+         *
+         * SA_RESTART, unlike the server: this process spends its time inside
+         * waitpid() and read(), where an EINTR reads as the agent having failed.
+         * The flag plus the sinks are what it needs; interrupting its syscalls
+         * would only corrupt the diagnosis. See shutdown.h.
+         */
+        shutdown_install_handlers(0);
+
         job->pid = getpid();
         return 0;
     }
