@@ -15,6 +15,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <poll.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -598,33 +601,16 @@ static int drain_children(void) {
     return killed;
 }
 
-int http_serve(int port, http_handler_fn handler) {
-    /* We do not want to die if a client abruptly closes the connection. */
-    signal(SIGPIPE, SIG_IGN);
-
-    /* We reap the finished children (served requests + agent jobs). */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = reap_children;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa, NULL);
-
-    /*
-     * Shutdown handlers, WITHOUT SA_RESTART - the 1 says so.
-     *
-     * This is the one place in the program that needs the interruption: the
-     * server spends its life parked in accept(), and with SA_RESTART that call
-     * would resume after the signal and the loop would never get to look at the
-     * flag. Note that the SIGCHLD handler above keeps SA_RESTART, so the two
-     * dispositions differ on purpose and for different reasons.
-     *
-     * Installing them here also replaces what daemon_start() used to do, which
-     * was to delete the PID file and _exit(0) immediately. That was a shutdown
-     * only in the sense that the server stopped.
-     */
-    shutdown_install_handlers(1);
-
+/*
+ * The listening sockets.
+ *
+ * HTTP does not care what kind of stream socket it runs over, so the TCP and
+ * unix listeners differ only in how they are set up: everything after accept()
+ * - reading the request, routing it, the fork per connection - is the same code
+ * for both. That is the whole reason this is worth doing rather than writing a
+ * second protocol for pixelgo-ops to speak.
+ */
+static int listen_tcp(int port) {
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
         LOG_E("http: socket() failed: %s", strerror(errno));
@@ -674,86 +660,275 @@ int http_serve(int port, http_handler_fn handler) {
         close(srv);
         return -1;
     }
+    return srv;
+}
+
+/* Is something already listening on this socket file? */
+static int unix_socket_in_use(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+
+    int in_use = connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0;
+    close(fd);
+    return in_use;
+}
+
+/*
+ * The unix-socket listener (PIXELGO_UNIX_SOCKET).
+ *
+ * This is the channel pixelgo-ops uses. It matters that it is a FILE: ops can
+ * talk to a real pixelgo over it with no network, no VM and no hypervisor in
+ * the way, so the two can be developed against each other today rather than
+ * after the VM work lands. The vsock listener, once it exists, is the same code
+ * again with a different address family.
+ *
+ * Access control is the filesystem. The socket is created 0600, so only the
+ * user running pixelgo can connect - which is the same trust boundary as the
+ * loopback bind, expressed in a way that does not involve the network at all.
+ */
+static int listen_unix(const char *path) {
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+
+    /* sun_path is a fixed-size field, so an over-long path is a configuration
+       error rather than something to truncate silently into the wrong socket. */
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        LOG_E("http: PIXELGO_UNIX_SOCKET is too long (%zu chars, max %zu)",
+              strlen(path), sizeof(addr.sun_path) - 1);
+        return -1;
+    }
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+    /*
+     * A socket file left over from a crash looks exactly like a live one, so we
+     * ask before removing it: if something answers, that is another pixelgo and
+     * we must not take its socket away. If nothing answers, the file is stale.
+     */
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (!S_ISSOCK(st.st_mode)) {
+            LOG_E("http: '%s' exists and is not a socket, refusing to replace it",
+                  path);
+            return -1;
+        }
+        if (unix_socket_in_use(path)) {
+            LOG_E("http: '%s' is already in use by another server", path);
+            return -1;
+        }
+        LOG_W("http: removing the stale socket '%s'", path);
+        if (unlink(path) != 0) {
+            LOG_E("http: cannot remove '%s': %s", path, strerror(errno));
+            return -1;
+        }
+    }
+
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) {
+        LOG_E("http: unix socket() failed: %s", strerror(errno));
+        return -1;
+    }
+
+    /* The umask decides the mode at bind time; the chmod afterwards is for the
+       umasks that would have allowed more. Both, because the window between
+       them is the only time the socket is reachable by anyone else. */
+    mode_t old_umask = umask(0177);
+    int rc = bind(srv, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
+
+    if (rc < 0) {
+        LOG_E("http: bind on '%s' failed: %s", path, strerror(errno));
+        close(srv);
+        return -1;
+    }
+    if (chmod(path, 0600) != 0)
+        LOG_W("http: cannot set the mode of '%s': %s", path, strerror(errno));
+
+    if (listen(srv, 16) < 0) {
+        LOG_E("http: listen on '%s' failed: %s", path, strerror(errno));
+        close(srv);
+        unlink(path);
+        return -1;
+    }
+    return srv;
+}
+
+int http_serve(int port, http_handler_fn handler) {
+    /* We do not want to die if a client abruptly closes the connection. */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* We reap the finished children (served requests + agent jobs). */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = reap_children;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    /*
+     * Shutdown handlers, WITHOUT SA_RESTART - the 1 says so.
+     *
+     * This is the one place in the program that needs the interruption: the
+     * server spends its life parked in accept(), and with SA_RESTART that call
+     * would resume after the signal and the loop would never get to look at the
+     * flag. Note that the SIGCHLD handler above keeps SA_RESTART, so the two
+     * dispositions differ on purpose and for different reasons.
+     *
+     * Installing them here also replaces what daemon_start() used to do, which
+     * was to delete the PID file and _exit(0) immediately. That was a shutdown
+     * only in the sense that the server stopped.
+     */
+    shutdown_install_handlers(1);
+
+    int srv = listen_tcp(port);
+    if (srv < 0) return -1;
+
+    /* The optional second door, for pixelgo-ops. Absent by default: a local
+       install gets exactly what it got before. */
+    const char *sock_path = getenv("PIXELGO_UNIX_SOCKET");
+    int usrv = -1;
+    if (sock_path && sock_path[0]) {
+        usrv = listen_unix(sock_path);
+        if (usrv < 0) { close(srv); return -1; }
+    }
 
     LOG_I("http: server started at http://127.0.0.1:%d", port);
     printf("\n  Web interface: http://127.0.0.1:%d\n", port);
+    if (usrv >= 0) {
+        LOG_I("http: also listening on the unix socket '%s'", sock_path);
+        printf("  API socket:    %s\n", sock_path);
+    }
     printf("  Ctrl+C to stop.\n\n");
     fflush(stdout);
 
     while (!shutdown_requested()) {
-        struct sockaddr_in cli;
-        socklen_t clilen = sizeof(cli);
-        int fd = accept(srv, (struct sockaddr *)&cli, &clilen);
-        if (fd < 0) {
-            /* A shutdown signal is what this EINTR usually is: the handler is
-               installed without SA_RESTART precisely so accept() lands here.
-               The loop condition sorts the two cases out. */
+        /*
+         * Two listeners, one loop. poll() rather than two accept() calls,
+         * because a blocking accept on the first socket would starve the
+         * second: nobody could reach the API over the socket while no browser
+         * happened to connect.
+         *
+         * No timeout. The shutdown handler is installed without SA_RESTART, so
+         * a signal makes this return EINTR, which is how the loop gets to look
+         * at the flag; a timeout here would only add wakeups that do nothing.
+         */
+        struct pollfd pfd[2];
+        int n = 0;
+        pfd[n].fd = srv;  pfd[n].events = POLLIN; pfd[n].revents = 0; n++;
+        if (usrv >= 0) { pfd[n].fd = usrv; pfd[n].events = POLLIN; pfd[n].revents = 0; n++; }
+
+        if (poll(pfd, (nfds_t)n, -1) < 0) {
             if (errno == EINTR) continue;
-            LOG_W("http: accept failed: %s", strerror(errno));
+            LOG_W("http: poll failed: %s", strerror(errno));
             continue;
         }
 
-        /* The signal can also arrive between accept() returning and the fork.
-           Closing the connection unserved is better than starting work we are
-           about to abandon; the browser sees a dropped connection, which is
-           what it would have seen a moment later anyway. */
-        if (shutdown_requested()) {
-            close(fd);
-            break;
-        }
+        for (int i = 0; i < n && !shutdown_requested(); i++) {
+            if (!(pfd[i].revents & POLLIN)) continue;
 
-        /*
-         * CONCURRENCY: one fork per connection. Each client is served in a
-         * separate process, so a slow request no longer blocks the others, and a
-         * handler that crashes does not take the server with it.
-         *
-         * Why fork and not threads: the core uses global state and fork for the
-         * agents; processes give us isolation for free, without having to make
-         * everything thread-safe. For a local control panel, the cost of a fork
-         * per request is negligible.
-         */
-        pid_t pid = fork();
+            int listener = pfd[i].fd;
+            int on_unix = (listener == usrv);
 
-        if (pid == 0) {
-            /* --- child: serves the request and exits --- */
-            close(srv);           /* the child does not need the listening socket */
-
-            http_req_t req;
-            http_res_t res;
-            memset(&res, 0, sizeof(res));
-
-            if (read_request(fd, &req)) {
-                LOG_D("http: %s %s", req.method, req.path);
-
-                /* Before routing: is this request allowed to reach a handler
-                   at all? See http_origin_allowed() in http_server.h. */
-                if (!http_origin_allowed(&req, port)) {
-                    LOG_W("http: refused %s %s (Host='%s' Origin='%s')",
-                          req.method, req.path, req.host, req.origin);
-                    http_res_error(&res, 403, "forbidden: Host or Origin is not this server");
-                } else {
-                    handler(&req, &res);
-                    if (res.status == 0)
-                        http_res_error(&res, 500, "the handler did not set the response");
-                }
-                send_response(fd, &res);
-                if (res.body_is_heap && res.body) free(res.body);
+            /* The address is read and dropped: nothing downstream uses the peer
+               address, and over a unix socket there is not one to speak of. */
+            int fd = accept(listener, NULL, NULL);
+            if (fd < 0) {
+                /* A shutdown signal is what this EINTR usually is: the handler
+                   is installed without SA_RESTART precisely so this lands here.
+                   The loop condition sorts the two cases out. */
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                LOG_W("http: accept failed: %s", strerror(errno));
+                continue;
             }
+
+            /* The signal can also arrive between accept() returning and the
+               fork. Closing the connection unserved is better than starting
+               work we are about to abandon; the browser sees a dropped
+               connection, which is what it would have seen a moment later. */
+            if (shutdown_requested()) {
+                close(fd);
+                break;
+            }
+
+            /*
+             * CONCURRENCY: one fork per connection. Each client is served in a
+             * separate process, so a slow request no longer blocks the others,
+             * and a handler that crashes does not take the server with it.
+             *
+             * Why fork and not threads: the core uses global state and fork for
+             * the agents; processes give us isolation for free, without having
+             * to make everything thread-safe. For a local control panel, the
+             * cost of a fork per request is negligible.
+             */
+            pid_t pid = fork();
+
+            if (pid == 0) {
+                /* --- child: serves the request and exits --- */
+                close(srv);                    /* not ours any more */
+                if (usrv >= 0) close(usrv);
+
+                http_req_t req;
+                http_res_t res;
+                memset(&res, 0, sizeof(res));
+
+                if (read_request(fd, &req)) {
+                    LOG_D("http: %s %s%s", req.method, req.path,
+                          on_unix ? " (socket)" : "");
+
+                    /*
+                     * Before routing: is this request allowed to reach a
+                     * handler at all? See http_origin_allowed().
+                     *
+                     * Not over the unix socket. That check defends against a
+                     * BROWSER being talked into reaching the API - a rebound
+                     * hostname, a form on another page - and it works by
+                     * recognising our own authority in Host and Origin. A unix
+                     * socket has no authority to recognise and no browser can
+                     * open one; the caller is a process that already holds
+                     * 0600 access to the socket file, which is the real check.
+                     * Applying the rule here would mean guessing what Host a
+                     * non-browser client ought to have sent.
+                     */
+                    if (!on_unix && !http_origin_allowed(&req, port)) {
+                        LOG_W("http: refused %s %s (Host='%s' Origin='%s')",
+                              req.method, req.path, req.host, req.origin);
+                        http_res_error(&res, 403, "forbidden: Host or Origin is not this server");
+                    } else {
+                        handler(&req, &res);
+                        if (res.status == 0)
+                            http_res_error(&res, 500, "the handler did not set the response");
+                    }
+                    send_response(fd, &res);
+                    if (res.body_is_heap && res.body) free(res.body);
+                }
+                close(fd);
+                _exit(0);
+            }
+
+            if (pid < 0)
+                LOG_W("http: fork failed, the request is ignored: %s", strerror(errno));
+            else
+                track_child(pid);   /* so the reaper knows this one is ours */
+
+            /* --- parent: closes the client socket, back to the poll --- */
             close(fd);
-            _exit(0);
         }
-
-        if (pid < 0)
-            LOG_W("http: fork failed, the request is ignored: %s", strerror(errno));
-        else
-            track_child(pid);   /* so the reaper knows this one is ours */
-
-        /* --- parent: closes the client socket and waits for the next one --- */
-        close(fd);
     }
 
     /* Stop listening first, so nothing new arrives while we drain. */
     close(srv);
+    if (usrv >= 0) {
+        close(usrv);
+        /* The socket file outlives the socket, and a leftover one is
+           indistinguishable from a live server to whoever looks next. */
+        if (sock_path && unlink(sock_path) != 0 && errno != ENOENT)
+            LOG_W("http: cannot remove '%s': %s", sock_path, strerror(errno));
+    }
 
     LOG_I("http: shutting down");
     printf("\n  Stopping - waiting for the running jobs...\n");
