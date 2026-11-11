@@ -71,6 +71,8 @@ a client must not rely on it until its status changes.
 | --- | --- | --- | --- | --- |
 | GET | `/` | `text/html; charset=utf-8` | 1048576 | implemented |
 | GET | `/index.html` | `text/html; charset=utf-8` | 1048576 | implemented |
+| GET | `/healthz` | `application/json; charset=utf-8` | 4096 | implemented |
+| GET | `/readyz` | `application/json; charset=utf-8` | 4096 | implemented |
 | GET | `/api/workspaces` | `application/json; charset=utf-8` | 16384 | implemented |
 | POST | `/api/workspaces` | `application/json; charset=utf-8` | 4096 | implemented |
 | GET | `/api/agents` | `application/json; charset=utf-8` | 32768 | implemented |
@@ -89,8 +91,6 @@ a client must not rely on it until its status changes.
 | GET | `/api/jobs/{id}/data-edit-source` | `text/plain; charset=utf-8` | 4194304 | implemented |
 | POST | `/api/jobs/{id}/approve` | `application/json; charset=utf-8` | 4096 | implemented |
 | POST | `/api/jobs/{id}/data-edit` | `application/json; charset=utf-8` | 4096 | implemented |
-| GET | `/healthz` | `application/json; charset=utf-8` | 4096 | planned |
-| GET | `/readyz` | `application/json; charset=utf-8` | 4096 | planned |
 | GET | `/api/logs` | `application/json; charset=utf-8` | 131072 | planned |
 <!-- routes:end -->
 
@@ -99,6 +99,44 @@ forwards all of them, since it serves the same UI. The planned routes are for
 pixelgo-ops.
 
 ## Routes
+
+### `GET /healthz`
+
+Liveness, for `pixelgo-ops status` and for the version check ops performs
+before serving its own copy of the UI. No parameters.
+
+Depends on nothing: no state, no filesystem, no locks. A server in trouble has
+to be able to answer "are you alive", so anything this route consulted would be
+something that could make it lie.
+
+- `200` — `{"status": "ok", "version": string, "contract": number}`, where
+  `contract` is this document's contract version.
+
+### `GET /readyz`
+
+Whether the server takes new work. No parameters.
+
+- `200` — `{"ready": boolean, "reason": string}`. `reason` is `""` when ready,
+  and otherwise a short fixed phrase saying what is wrong.
+
+Answers `200` in both cases, by design. A draining server is in a correct
+state, not an erroring one, and `503` would be the wrong word for it; clients
+read the field.
+
+`ready` is false when:
+
+- the server is shutting down and draining running work — but see below,
+- the jobs directory is missing or cannot be written to. Every chat and every
+  flow run starts by writing a file there, so this is a server that is healthy,
+  reachable, and unable to do the only thing it is for. Nothing else reports it.
+
+**A refused connection is the main draining signal, not this route.** Shutdown
+closes the listening sockets before it starts draining, so a connection opened
+after that point is refused by the kernel and never reaches any route. For a
+client, "connection refused" means stopped or draining, and it is unambiguous.
+The draining branch here covers the narrower case where the signal reached the
+server process before the connection was forked, which is what a terminal
+`Ctrl+C` does to the whole process group.
 
 ### `GET /` and `GET /index.html`
 
@@ -281,22 +319,6 @@ The human's decision for a pending editable-approval request.
 
 Defined now so pixelgo and pixelgo-ops can build against them. Not implemented
 in this version.
-
-### `GET /healthz` (planned)
-
-Liveness, for `pixelgo-ops status` and for the version check ops performs
-before serving its own copy of the UI.
-
-- `200` — `{"status": "ok", "version": string, "contract": number}`, where
-  `contract` is this document's contract version.
-
-### `GET /readyz` (planned)
-
-Whether the server takes new work.
-
-- `200` — `{"ready": boolean, "reason": string}`. `ready` is false while the
-  server is shutting down and draining running work (see the graceful shutdown
-  work), with `reason` saying why.
 
 ### `GET /api/logs` (planned)
 

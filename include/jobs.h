@@ -72,6 +72,13 @@ int job_get(const char *id, job_t *out);
 int jobs_cleanup(int max_age_seconds);
 
 /*
+ * Whether a job can be created at all: the jobs directory exists and this
+ * process can write into it. Reported by GET /readyz, because a server that
+ * accepts work it cannot record is not ready even though it is healthy.
+ */
+int jobs_writable(void);
+
+/*
  * Fills `out` with the pids of the jobs still marked running whose process is
  * actually alive, and returns how many it wrote (at most `max`).
  *

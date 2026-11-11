@@ -248,8 +248,12 @@ static void test_no_drift(const char *doc) {
     eq_int("same number of implemented routes on both sides", doc_implemented, (long)n);
     ok("planned routes are not in code yet (mark them implemented when they are)",
        planned_absent);
-    ok("the document defines the planned routes /healthz, /readyz, /api/logs",
-       doc_planned == 3);
+    /* /healthz and /readyz are implemented and so are counted above; /api/logs
+       is the one still declared ahead of its implementation. Lower this as the
+       rest land, rather than deleting the check: the point of it is that the
+       document cannot quietly stop declaring what ops is building against. */
+    ok("the document still declares the planned route /api/logs",
+       doc_planned == 1);
 }
 
 /* ---------- 2. exact routing ---------- */
