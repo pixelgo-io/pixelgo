@@ -102,6 +102,22 @@ int jobs_init(void) {
 }
 
 /*
+ * Can we actually start a job?
+ *
+ * Every chat and every flow run begins by writing a file in here, so a jobs
+ * directory that cannot be written to means the server accepts work it will
+ * then fail to record. That is a readiness question rather than a health one:
+ * the process is fine, it just cannot do the thing it is for. /readyz reports
+ * it, which is the only way ops finds out before submitting work.
+ *
+ * X_OK as well as W_OK: creating a file in a directory needs both.
+ */
+int jobs_writable(void) {
+    if (!jobs_init()) return 0;
+    return access(g_jobs_dir, W_OK | X_OK) == 0;
+}
+
+/*
  * The pids of the jobs that are still running.
  *
  * This is how the server finds its grandchildren at shutdown. A job is forked

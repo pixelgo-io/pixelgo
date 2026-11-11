@@ -11,6 +11,8 @@
 #include "jobs.h"
 #include "events.h"
 #include "json_util.h"
+#include "shutdown.h"
+#include "version.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -992,6 +994,68 @@ static void route_limits(http_res_t *res) {
     http_res_json(res, 200, json);
 }
 
+/*
+ * GET /healthz - liveness.
+ *
+ * Deliberately the dullest route in the file: no state, no filesystem, no
+ * locks, nothing that can be slow or fail. The answer to "are you alive" has to
+ * be answerable by a server that is in trouble, so anything it depends on is
+ * something that can make it lie.
+ *
+ * The version and the contract are here because ops serves its own copy of the
+ * UI and has to refuse to run against an engine whose contract it does not
+ * speak - better one refusal at startup than a field that moved.
+ */
+static void route_healthz(const http_req_t *req, http_res_t *res) {
+    (void)req;
+    char json[256];
+    snprintf(json, sizeof(json),
+             "{\"status\":\"ok\",\"version\":\"%s\",\"contract\":%d}",
+             PIXELGO_VERSION, WEB_API_CONTRACT_VERSION);
+    http_res_json(res, 200, json);
+}
+
+/*
+ * GET /readyz - does the server take new work?
+ *
+ * Answers 200 in both cases, with `ready` saying which, as docs/API.md
+ * specifies. Not 503: ops reads the field, and a status code that says "server
+ * error" for a server that is deliberately draining would be the wrong word for
+ * a correct state.
+ *
+ * On draining, note what this can and cannot see. A drain closes the listening
+ * sockets first (see shutdown.h), so a connection that arrives afterwards is
+ * refused by the kernel and never reaches this code - for ops, a refused
+ * connection IS the signal, and it is unambiguous. This branch covers the
+ * narrower case where the signal reached this process before it was forked,
+ * which is what a terminal Ctrl+C does to the whole process group.
+ *
+ * So the branch that earns its place is the other one. A jobs directory that
+ * cannot be written to is a server that is healthy, reachable, and unable to do
+ * the only thing it exists for, and nothing else would tell you.
+ *
+ * Every reason is a fixed string, so none of this needs JSON escaping. Keep it
+ * that way: the moment a reason carries a path or an errno, it needs escaping,
+ * and this route must not be the one that gets that wrong.
+ */
+static void route_readyz(const http_req_t *req, http_res_t *res) {
+    (void)req;
+    const char *reason = NULL;
+
+    if (shutdown_requested())
+        reason = "shutting down: draining the running jobs";
+    else if (!jobs_writable())
+        reason = "the jobs directory is missing or not writable";
+
+    char json[256];
+    if (reason)
+        snprintf(json, sizeof(json), "{\"ready\":false,\"reason\":\"%s\"}", reason);
+    else
+        snprintf(json, sizeof(json), "{\"ready\":true,\"reason\":\"\"}");
+
+    http_res_json(res, 200, json);
+}
+
 /* --- the route table --- */
 
 /* Adapters for the routes whose handlers take no request. */
@@ -1026,6 +1090,8 @@ static void route_limits_r(const http_req_t *req, http_res_t *res) {
 static const web_route_t ROUTES[] = {
     { "GET",  "/",                               CT_HTML, 1048576,              route_index },
     { "GET",  "/index.html",                     CT_HTML, 1048576,              route_index },
+    { "GET",  "/healthz",                        CT_JSON, SMALL,                route_healthz },
+    { "GET",  "/readyz",                         CT_JSON, SMALL,                route_readyz },
     { "GET",  "/api/workspaces",                 CT_JSON, 16384,                route_workspaces_list_r },
     { "POST", "/api/workspaces",                 CT_JSON, SMALL,                route_workspace_create },
     { "GET",  "/api/agents",                     CT_JSON, 32768,                route_agents_list },
