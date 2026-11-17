@@ -11,6 +11,7 @@
 #include "jobs.h"
 #include "events.h"
 #include "json_util.h"
+#include "daemon.h"
 #include "shutdown.h"
 #include "version.h"
 #include "log.h"
@@ -994,6 +995,228 @@ static void route_limits(http_res_t *res) {
     http_res_json(res, 200, json);
 }
 
+/* --- routes: logs --- */
+
+#define LOGS_LINES_DEFAULT 200
+#define LOGS_LINES_MAX     1000
+
+/*
+ * The byte budget for the lines we return.
+ *
+ * The route's contract cap is 131072, and the cap is enforced in one place for
+ * every route: a body over it is replaced with a 500. So a tail that happens to
+ * be large would not come back truncated, it would come back as an error - the
+ * failure /api/history has today, where a history at its own token budget is
+ * several times larger than the route that serves it.
+ *
+ * No line count prevents it, because a single logged tool result can be larger
+ * than any sensible number of ordinary lines. The budget has to be in bytes,
+ * and it has to be enforced here rather than discovered there. Well under the
+ * cap, since the JSON escaping of control characters can expand a line.
+ */
+#define LOGS_BYTE_BUDGET   (96 * 1024)
+
+/* How far back we are willing to read to find the requested lines. The log is
+   append-only and unbounded; this is the only thing that stops a request from
+   reading a gigabyte to answer a question about the last 200 lines. */
+#define LOGS_SCAN_LIMIT    (4 * 1024 * 1024)
+
+/*
+ * GET /api/logs - the end of pixelgo.log, for `pixelgo-ops logs`.
+ *
+ * Reads backwards from the end rather than forwards from the start: the log
+ * grows without bound and the interesting part is always the last page of it.
+ *
+ * Two things about this route are worth knowing before changing it.
+ *
+ * It makes log content remotely readable, which promotes "never log a secret"
+ * from hygiene to a security boundary. The provider key already must never
+ * reach a log line; after this route, that rule is load-bearing.
+ *
+ * And the content is attacker-influenced: an agent's output, a tool's output, a
+ * hostname from a page it fetched. It is escaped as JSON by cJSON, which makes
+ * it safe to parse - not safe to print. A line can carry terminal escape
+ * sequences, and docs/API.md puts the duty of stripping them on the client,
+ * because the server's copy of the record should be the record.
+ */
+static void route_logs(const http_req_t *req, http_res_t *res) {
+    char lines_s[32];
+    long want = LOGS_LINES_DEFAULT;
+
+    if (http_query_get(req->query, "lines", lines_s, sizeof(lines_s))) {
+        char *end = NULL;
+        long v = strtol(lines_s, &end, 10);
+        /* A value we cannot read is a mistake worth naming, not one to paper
+           over with the default: a client asking for "last" or "1O0" wants
+           something specific and should be told it did not arrive. */
+        if (end == lines_s || v <= 0) {
+            http_res_error(res, 400, "lines must be a positive integer");
+            return;
+        }
+        want = v > LOGS_LINES_MAX ? LOGS_LINES_MAX : v;
+    }
+
+    FILE *f = fopen(DAEMON_LOG_FILE, "rb");
+    if (!f) {
+        /* A server started without --daemon writes no log file at all: its
+           output went to the terminal. An empty answer is the truthful one -
+           there is no log here - and it is not an error. */
+        http_res_json(res, 200, "{\"lines\":[],\"truncated\":false}");
+        return;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        http_res_error(res, 500, "cannot read the log");
+        return;
+    }
+    long size = ftell(f);
+    if (size < 0) { fclose(f); http_res_error(res, 500, "cannot read the log"); return; }
+
+    long scan = size > LOGS_SCAN_LIMIT ? LOGS_SCAN_LIMIT : size;
+    char *buf = malloc((size_t)scan + 1);
+    if (!buf) { fclose(f); http_res_error(res, 500, "out of memory"); return; }
+
+    if (fseek(f, size - scan, SEEK_SET) != 0 ||
+        fread(buf, 1, (size_t)scan, f) != (size_t)scan) {
+        free(buf);
+        fclose(f);
+        http_res_error(res, 500, "cannot read the log");
+        return;
+    }
+    fclose(f);
+    buf[scan] = 0;
+
+    /*
+     * Walk backwards collecting line starts, stopping at the line count, at the
+     * byte budget, or at the top of what we read - whichever comes first.
+     *
+     * A trailing newline is skipped so that a log ending in "\n" does not
+     * report a final empty line.
+     */
+    long end_pos = scan;
+    if (end_pos > 0 && buf[end_pos - 1] == '\n') end_pos--;
+
+    /* An empty log has no lines. Without this, the walk below finds the one
+       zero-length stretch between the start and the end and reports a single
+       empty line, which is a different claim from "nothing has been logged". */
+    if (end_pos == 0) {
+        free(buf);
+        http_res_json(res, 200, "{\"lines\":[],\"truncated\":false}");
+        return;
+    }
+
+    long *starts = malloc(sizeof(long) * (size_t)want);
+    if (!starts) { free(buf); http_res_error(res, 500, "out of memory"); return; }
+
+    int count = 0;
+    long bytes = 0;
+    long cut = end_pos;          /* one past the end of the oldest line kept */
+    int truncated = 0;
+
+    for (long i = end_pos - 1; i >= -1 && count < (int)want; i--) {
+        if (i >= 0 && buf[i] != '\n') continue;
+
+        long line_start = i + 1;
+        long line_len = cut - line_start;
+
+        if (bytes + line_len > LOGS_BYTE_BUDGET) { truncated = 1; break; }
+
+        starts[count++] = line_start;
+        bytes += line_len;
+        cut = i;                 /* the newline itself is not part of a line */
+        if (i < 0) break;
+    }
+
+    /* We read a window, not the file: if the window did not reach the start of
+       the file and we stopped for want of lines, there is more above. */
+    if (!truncated && count >= (int)want && (scan < size || cut > 0)) truncated = 1;
+    if (scan < size && count < (int)want) truncated = 1;
+
+    /*
+     * One line can be larger than the whole budget - a logged tool result, a
+     * dumped response body. The loop above then fits nothing and we would
+     * answer with an empty array and a flag: "there are logs, you may not have
+     * any of them". That is the one case where the enormous line is usually the
+     * thing being looked for, so return its beginning instead.
+     *
+     * Its beginning, not its end: the informative part of a log line is the
+     * timestamp, the level and the start of the message, and the payload that
+     * made it huge comes after.
+     */
+    long forced_len = 0;
+    if (count == 0) {
+        long last_nl = -1;
+        for (long i = end_pos - 1; i >= 0; i--) {
+            if (buf[i] == '\n') { last_nl = i; break; }
+        }
+        long line_start = last_nl + 1;
+        forced_len = LOGS_BYTE_BUDGET;
+        if (line_start + forced_len > end_pos) forced_len = end_pos - line_start;
+
+        /*
+         * Do not cut in the middle of a UTF-8 sequence: the bytes would still
+         * be valid JSON after escaping, but the string would not be valid
+         * UTF-8, and a strict parser on the client is entitled to reject the
+         * whole response over it.
+         */
+        while (forced_len > 0 &&
+               (unsigned char)buf[line_start + forced_len - 1] >= 0x80 &&
+               (unsigned char)buf[line_start + forced_len - 1] <= 0xBF) {
+            forced_len--;   /* a continuation byte */
+        }
+        if (forced_len > 0 && (unsigned char)buf[line_start + forced_len - 1] >= 0xC0)
+            forced_len--;   /* a lead byte whose sequence we just removed */
+
+        starts[0] = line_start;
+        count = 1;
+        truncated = 1;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_CreateArray();
+    if (!root || !arr) {
+        if (root) cJSON_Delete(root);
+        if (arr) cJSON_Delete(arr);
+        free(starts); free(buf);
+        http_res_error(res, 500, "out of memory");
+        return;
+    }
+
+    /* Oldest first, as the contract says, so the array is built in reverse of
+       the order the lines were found. */
+    for (int i = count - 1; i >= 0; i--) {
+        long start = starts[i];
+        long next = (i == 0) ? end_pos : starts[i - 1] - 1;
+        long len = next - start;
+        if (len < 0) len = 0;
+        if (forced_len > 0) len = forced_len;   /* the one over-size line */
+
+        char *line = malloc((size_t)len + 1);
+        if (!line) break;
+        memcpy(line, buf + start, (size_t)len);
+        line[len] = 0;
+        cJSON_AddItemToArray(arr, cJSON_CreateString(line));
+        free(line);
+    }
+
+    cJSON_AddItemToObject(root, "lines", arr);
+    cJSON_AddBoolToObject(root, "truncated", truncated ? 1 : 0);
+
+    free(starts);
+    free(buf);
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) { http_res_error(res, 500, "out of memory"); return; }
+
+    /* http_res_static does not copy, which is right for a literal and wrong for
+       this buffer; the flag hands ownership to the response layer, which frees
+       it after sending. Same pattern as the UI route above. */
+    http_res_static(res, 200, "application/json; charset=utf-8", out, strlen(out));
+    res->body_is_heap = 1;
+}
+
 /*
  * GET /healthz - liveness.
  *
@@ -1090,6 +1313,7 @@ static void route_limits_r(const http_req_t *req, http_res_t *res) {
 static const web_route_t ROUTES[] = {
     { "GET",  "/",                               CT_HTML, 1048576,              route_index },
     { "GET",  "/index.html",                     CT_HTML, 1048576,              route_index },
+    { "GET",  "/api/logs",                       CT_JSON, 131072,               route_logs },
     { "GET",  "/healthz",                        CT_JSON, SMALL,                route_healthz },
     { "GET",  "/readyz",                         CT_JSON, SMALL,                route_readyz },
     { "GET",  "/api/workspaces",                 CT_JSON, 16384,                route_workspaces_list_r },

@@ -248,12 +248,16 @@ static void test_no_drift(const char *doc) {
     eq_int("same number of implemented routes on both sides", doc_implemented, (long)n);
     ok("planned routes are not in code yet (mark them implemented when they are)",
        planned_absent);
-    /* /healthz and /readyz are implemented and so are counted above; /api/logs
-       is the one still declared ahead of its implementation. Lower this as the
-       rest land, rather than deleting the check: the point of it is that the
-       document cannot quietly stop declaring what ops is building against. */
-    ok("the document still declares the planned route /api/logs",
-       doc_planned == 1);
+    /*
+     * Nothing is declared ahead of its implementation any more: every route in
+     * the table exists in the code.
+     *
+     * Kept at zero rather than deleted, as a tripwire. Declaring a route before
+     * building it is a useful thing to do - it is how ops got something to
+     * build against - and this makes doing it a deliberate edit here, instead
+     * of a row somebody adds and forgets to come back to.
+     */
+    ok("every declared route is implemented", doc_planned == 0);
 }
 
 /* ---------- 2. exact routing ---------- */

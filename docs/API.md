@@ -71,6 +71,7 @@ a client must not rely on it until its status changes.
 | --- | --- | --- | --- | --- |
 | GET | `/` | `text/html; charset=utf-8` | 1048576 | implemented |
 | GET | `/index.html` | `text/html; charset=utf-8` | 1048576 | implemented |
+| GET | `/api/logs` | `application/json; charset=utf-8` | 131072 | implemented |
 | GET | `/healthz` | `application/json; charset=utf-8` | 4096 | implemented |
 | GET | `/readyz` | `application/json; charset=utf-8` | 4096 | implemented |
 | GET | `/api/workspaces` | `application/json; charset=utf-8` | 16384 | implemented |
@@ -91,7 +92,6 @@ a client must not rely on it until its status changes.
 | GET | `/api/jobs/{id}/data-edit-source` | `text/plain; charset=utf-8` | 4194304 | implemented |
 | POST | `/api/jobs/{id}/approve` | `application/json; charset=utf-8` | 4096 | implemented |
 | POST | `/api/jobs/{id}/data-edit` | `application/json; charset=utf-8` | 4096 | implemented |
-| GET | `/api/logs` | `application/json; charset=utf-8` | 131072 | planned |
 <!-- routes:end -->
 
 Callers: every implemented route is used by the embedded UI, and pixelgo-ops
@@ -137,6 +137,45 @@ client, "connection refused" means stopped or draining, and it is unambiguous.
 The draining branch here covers the narrower case where the signal reached the
 server process before the connection was forked, which is what a terminal
 `Ctrl+C` does to the whole process group.
+
+### `GET /api/logs`
+
+The end of `pixelgo.log`, for `pixelgo-ops logs`.
+
+- Query: `lines` (optional, default 200, at most 1000). A value that is not a
+  positive integer is a `400` rather than a silent fallback to the default: a
+  client that asked for something specific should be told it did not arrive.
+- `200` — `{"lines": [string], "truncated": boolean}`, oldest first.
+
+`truncated` is true when what is returned is not the whole tail that was asked
+for — because the line count was reached, because the byte budget was, or
+because the route read a window of the file rather than all of it.
+
+**There is a byte budget as well as a line count**, and it is the reason this
+route cannot fail the way `/api/history` does. The response cap in the table is
+enforced for every route by replacing an over-size body with a `500`, and no
+line count can keep a response under it: a single logged tool result can be
+larger than a thousand ordinary lines. So the budget is in bytes, it is well
+under the cap, and reaching it sets `truncated`.
+
+**A single line larger than the budget comes back cut**, from its beginning,
+with `truncated` set — not dropped. In a crash that one enormous line is usually
+the thing being looked for, and an empty array with a flag would be the least
+useful honest answer available. The cut does not split a UTF-8 sequence.
+
+**A server started without `--daemon` writes no log file**: its output went to
+the terminal. The route then answers `{"lines": [], "truncated": false}`, which
+is the truthful answer — there is no log here — and not an error.
+
+Lines are returned as logged. Stripping control characters is the client's job,
+and it is not optional: a log line can carry terminal escape sequences, written
+there by an agent's output or by a page it fetched, and printing one to a
+terminal unfiltered is how that becomes the agent's problem to exploit. The
+server does not strip them because its copy of the record should be the record.
+
+Note that this route makes log content remotely readable, which turns "never log
+a secret" from hygiene into a security boundary. The provider key already must
+never reach a log line; after this route, that rule is load-bearing.
 
 ### `GET /` and `GET /index.html`
 
@@ -315,16 +354,3 @@ The human's decision for a pending editable-approval request.
 - `200` — `{"allowed": boolean}`.
 - `400` — invalid id or body. `500` — the decision could not be recorded.
 
-## Planned routes
-
-Defined now so pixelgo and pixelgo-ops can build against them. Not implemented
-in this version.
-
-### `GET /api/logs` (planned)
-
-The end of `pixelgo.log`, for `pixelgo-ops logs`.
-
-- Query: `lines` (optional, default 200, at most 1000).
-- `200` — `{"lines": [string]}`, oldest first. Lines are returned as logged;
-  the client is responsible for stripping control characters before printing
-  them to a terminal.
