@@ -5,7 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>   /* strcasestr - <strings.h> on macOS, a target platform */
+#include <strings.h>   /* kept for macOS, which declares strcasestr here;
+                          on Linux it comes from <string.h> above, under
+                          _GNU_SOURCE for musl and __USE_MISC for glibc -
+                          see CFLAGS. This include alone is not enough. */
 #include <time.h>
 
 #define DEFAULT_TIMEOUT_SEC 120L
