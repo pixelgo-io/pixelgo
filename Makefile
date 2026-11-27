@@ -1,5 +1,17 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -Iinclude -Ithird_party/cJSON -g
+# _GNU_SOURCE because strcasestr is a GNU extension and two files use it.
+# Both libcs declare it in <string.h>: glibc under __USE_MISC, which is on by
+# default, and musl under _GNU_SOURCE, which is not. So the code compiled
+# silently here and fell back to an implicit int-returning declaration
+# elsewhere - a truncated pointer in the HTTP header parser, which works only
+# while the buffer sits below 4 GB.
+#
+# Project-wide rather than per-file: a #define has to precede every include to
+# work, confine.c already carried its own, and a flag that must appear on line
+# one of some files and not others is a rule nobody will keep. Verified not to
+# change behaviour on glibc - basename in sandbox.c is the one call this could
+# have switched to the GNU variant, and <libgen.h> keeps the POSIX one.
+CFLAGS = -D_GNU_SOURCE -Wall -Wextra -Iinclude -Ithird_party/cJSON -g
 LDFLAGS = -lcurl
 
 SRC = \
